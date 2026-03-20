@@ -35,7 +35,6 @@ ENV/
 *.bin
 *.txt
 !scripts/*.txt
-data/
 outputs/
 
 # Logs
