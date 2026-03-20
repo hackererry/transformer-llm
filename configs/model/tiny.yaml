@@ -1,0 +1,12 @@
+# Tiny模型配置 (~10M参数)
+model:
+  vocab_size: 32000
+  hidden_size: 256
+  num_hidden_layers: 6
+  num_attention_heads: 8
+  intermediate_size: 512
+  max_position_embeddings: 1024
+  rope_theta: 10000.0
+  rms_norm_eps: 1.0e-6
+  hidden_dropout: 0.1
+  attention_dropout: 0.1

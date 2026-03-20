@@ -1,0 +1,12 @@
+# Small模型配置 (~100M参数)
+model:
+  vocab_size: 32000
+  hidden_size: 512
+  num_hidden_layers: 12
+  num_attention_heads: 8
+  intermediate_size: 1024
+  max_position_embeddings: 2048
+  rope_theta: 10000.0
+  rms_norm_eps: 1.0e-6
+  hidden_dropout: 0.1
+  attention_dropout: 0.1
