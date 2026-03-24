@@ -124,7 +124,7 @@ def main():
     else:
         tokenizer_path = args.output_dir
 
-    tokenizer = get_tokenizer(tokenizer_path, tokenizer_type="bpe")
+    tokenizer = get_tokenizer(tokenizer_path, tokenizer_type="bpe", use_fast=True)
 
     # 创建数据集
     logger.info(f"Loading training data from {args.train_file}")

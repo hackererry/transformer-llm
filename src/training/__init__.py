@@ -1,6 +1,6 @@
 """
 训练模块
-导出所有训练相关组件
+统一导出所有训练相关组件
 """
 from .optimizer import (
     create_optimizer,
@@ -26,20 +26,10 @@ from .checkpoint import (
 )
 from .trainer import (
     Trainer,
+    TrainingConfig,
     TrainerState,
+    PerformanceMonitor,
 )
-
-# GPU训练模块（可选导入）
-try:
-    from .trainer_gpu import (
-        GPUTrainer,
-        GPUTrainingConfig,
-        get_gpu_memory_info,
-        estimate_memory_requirements,
-    )
-    _gpu_trainer_available = True
-except ImportError:
-    _gpu_trainer_available = False
 
 __all__ = [
     # 优化器
@@ -63,14 +53,7 @@ __all__ = [
     "save_pretrained",
     # 训练器
     "Trainer",
+    "TrainingConfig",
     "TrainerState",
+    "PerformanceMonitor",
 ]
-
-# GPU训练（可选）
-if _gpu_trainer_available:
-    __all__.extend([
-        "GPUTrainer",
-        "GPUTrainingConfig",
-        "get_gpu_memory_info",
-        "estimate_memory_requirements",
-    ])

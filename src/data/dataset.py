@@ -15,7 +15,12 @@ class PretrainDataset(Dataset):
     """
     预训练数据集
     支持大规模文本文件的高效加载
+    支持新旧两种缓存格式：
+    - 新格式：包含 metadata 和 examples 的字典（支持元数据验证）
+    - 旧格式：直接的 examples 列表（向后兼容）
     """
+
+    CACHE_VERSION = "1.0"
 
     def __init__(
         self,
@@ -55,15 +60,35 @@ class PretrainDataset(Dataset):
 
         if os.path.exists(cache_path) and not overwrite:
             print(f"Loading cached data from {cache_path}")
-            return torch.load(cache_path)
+            cached_data = torch.load(cache_path, map_location="cpu", weights_only=False)
+
+            # 检测缓存格式：新格式(dict with metadata) vs 旧格式(list)
+            if isinstance(cached_data, dict) and "examples" in cached_data:
+                print(f"  Detected new cache format (v{cached_data.get('version', 'unknown')})")
+                self._metadata = cached_data.get("metadata", {})
+                return cached_data["examples"]
+            else:
+                print(f"  Detected legacy cache format (list)")
+                self._metadata = {}
+                return cached_data
 
         print(f"Processing data from {self.data_path}")
         examples = self._process_data()
 
-        # 保存缓存
-        torch.save(examples, cache_path)
+        # 保存为新格式
+        cache_data = {
+            "version": self.CACHE_VERSION,
+            "metadata": {
+                "max_seq_length": self.max_seq_length,
+                "num_examples": len(examples),
+                "original_file": self.data_path,
+            },
+            "examples": examples,
+        }
+        torch.save(cache_data, cache_path)
         print(f"Cached data saved to {cache_path}")
 
+        self._metadata = cache_data["metadata"]
         return examples
 
     def _process_data(self) -> List[Dict]:

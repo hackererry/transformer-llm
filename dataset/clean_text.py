@@ -29,6 +29,14 @@ class TextCleaner:
         return text
 
     @staticmethod
+    def remove_empty_lines(text: str) -> str:
+        """移除空行"""
+        lines = text.split('\n')
+        # 过滤掉空行（只包含空白字符的行也算空行）
+        non_empty_lines = [line.strip() for line in lines if line.strip()]
+        return '\n'.join(non_empty_lines)
+
+    @staticmethod
     def remove_extra_whitespace(text: str) -> str:
         """移除多余空白"""
         # 合并多个空格为一个
@@ -59,24 +67,6 @@ class TextCleaner:
     @staticmethod
     def normalize_punctuation(text: str) -> str:
         """规范化标点符号"""
-        # 中文标点统一
-        replacements = {
-            '，': '，',
-            '。': '。',
-            '！': '！',
-            '？': '？',
-            '；': '；',
-            '：': '：',
-            '"': '"',
-            '"': '"',
-            ''': ''',
-            ''': ''',
-            '（': '（',
-            '）': '）',
-            '【': '【',
-            '】': '】',
-        }
-
         # 英文标点规范化
         text = re.sub(r'\.{3,}', '...', text)  # 省略号
         text = re.sub(r'-{2,}', '——', text)   # 破折号
@@ -185,6 +175,7 @@ def clean_file(
 
     # 添加基本清洗
     cleaner.add_cleaner(TextCleaner.fix_encoding_issues)
+    cleaner.add_cleaner(TextCleaner.remove_empty_lines)
     cleaner.add_cleaner(TextCleaner.remove_extra_whitespace)
 
     if remove_urls:
@@ -277,6 +268,79 @@ def split_large_file(
     return files
 
 
+def batch_clean_directory(
+    input_dir: str,
+    output_dir: Optional[str] = None,
+    remove_urls: bool = False,
+    remove_emails: bool = False,
+    remove_page_numbers: bool = True,
+) -> List[str]:
+    """
+    批量清洗目录下的所有TXT文件
+
+    Args:
+        input_dir: 输入目录
+        output_dir: 输出目录（可选，默认覆盖原文件）
+        remove_urls: 是否移除URL
+        remove_emails: 是否移除邮箱
+        remove_page_numbers: 是否移除页码
+
+    Returns:
+        清洗成功的文件列表
+    """
+    input_dir = os.path.abspath(input_dir)
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        output_dir = input_dir
+
+    # 查找所有TXT文件
+    txt_files = []
+    for file in os.listdir(input_dir):
+        if file.lower().endswith('.txt'):
+            txt_files.append(os.path.join(input_dir, file))
+
+    if not txt_files:
+        print(f"在 {input_dir} 中未找到TXT文件")
+        return []
+
+    print(f"找到 {len(txt_files)} 个TXT文件")
+    print("=" * 50)
+
+    success_files = []
+    failed_files = []
+
+    for idx, input_path in enumerate(txt_files, 1):
+        print(f"\n[{idx}/{len(txt_files)}]")
+        try:
+            base_name = os.path.basename(input_path)
+            output_path = os.path.join(output_dir, base_name)
+
+            clean_file(
+                input_path,
+                output_path,
+                remove_urls=remove_urls,
+                remove_emails=remove_emails,
+                remove_page_numbers=remove_page_numbers,
+            )
+            success_files.append(output_path)
+        except Exception as e:
+            print(f"  错误: {e}")
+            failed_files.append(input_path)
+
+    # 打印总结
+    print("\n" + "=" * 50)
+    print(f"清洗完成: 成功 {len(success_files)}, 失败 {len(failed_files)}")
+
+    if failed_files:
+        print("\n失败的文件:")
+        for f in failed_files:
+            print(f"  - {f}")
+
+    return success_files
+
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="文本清洗工具")
@@ -285,8 +349,9 @@ def main():
 
     # clean 命令
     clean_parser = subparsers.add_parser("clean", help="清洗文本文件")
-    clean_parser.add_argument("input", help="输入文件路径")
+    clean_parser.add_argument("input", nargs="?", help="输入文件路径（与 -d 互斥）")
     clean_parser.add_argument("-o", "--output", help="输出文件路径")
+    clean_parser.add_argument("-d", "--dir", help="批量清洗的输入目录")
     clean_parser.add_argument("--remove-urls", action="store_true", help="移除URL")
     clean_parser.add_argument("--remove-emails", action="store_true", help="移除邮箱")
 
@@ -300,12 +365,24 @@ def main():
     args = parser.parse_args()
 
     if args.command == "clean":
-        clean_file(
-            args.input,
-            args.output,
-            remove_urls=args.remove_urls,
-            remove_emails=args.remove_emails,
-        )
+        if args.dir:
+            # 批量清洗模式
+            batch_clean_directory(
+                args.dir,
+                args.output,
+                remove_urls=args.remove_urls,
+                remove_emails=args.remove_emails,
+            )
+        elif args.input:
+            # 单文件清洗模式
+            clean_file(
+                args.input,
+                args.output,
+                remove_urls=args.remove_urls,
+                remove_emails=args.remove_emails,
+            )
+        else:
+            clean_parser.print_help()
     elif args.command == "split":
         split_large_file(
             args.input,

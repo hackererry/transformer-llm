@@ -1,11 +1,9 @@
 """
 数据处理模块
-导出所有数据处理相关组件
+统一导出所有数据处理相关组件
 """
 from .tokenizer import (
-    BaseTokenizer,
-    BPETokenizer,
-    HFTokenizer,
+    HuggingFaceBPETokenizer,
     get_tokenizer,
 )
 from .dataset import (
@@ -15,6 +13,12 @@ from .dataset import (
     TextFileDataset,
     MemoryMappedDataset,
     create_dataset,
+)
+from .preprocessed_dataset import (
+    PreprocessedDataset,
+    ShardedPreprocessedDataset,
+    save_preprocessed_data,
+    create_sharded_dataset,
 )
 from .collator import (
     DataCollatorForLanguageModeling,
@@ -26,17 +30,20 @@ from .collator import (
 
 __all__ = [
     # Tokenizer
-    "BaseTokenizer",
-    "BPETokenizer",
-    "HFTokenizer",
+    "HuggingFaceBPETokenizer",
     "get_tokenizer",
-    # Dataset
+    # Dataset (raw text)
     "PretrainDataset",
     "PretrainIterableDataset",
     "FinetuneDataset",
     "TextFileDataset",
     "MemoryMappedDataset",
     "create_dataset",
+    # Preprocessed Dataset (optimized)
+    "PreprocessedDataset",
+    "ShardedPreprocessedDataset",
+    "save_preprocessed_data",
+    "create_sharded_dataset",
     # Collator
     "DataCollatorForLanguageModeling",
     "DataCollatorForCausalLM",

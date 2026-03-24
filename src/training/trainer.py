@@ -1,22 +1,176 @@
 """
-训练器模块
-完整的训练循环实现
+统一训练器模块
+支持CPU和GPU训练，自动检测最佳设备
 """
 import os
 import time
 import signal
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import autocast, GradScaler
-from src.utils import get_device
-from typing import Optional, Dict, Any, Callable, Union, Tuple
+from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch.cuda.amp import GradScaler
+from typing import Optional, Dict, Any, Callable, List
+from dataclasses import dataclass, field
 import math
 from tqdm import tqdm
+from contextlib import contextmanager
 
 from .optimizer import create_optimizer
 from .scheduler import create_scheduler
 from .checkpoint import CheckpointManager, save_model
+
+
+@dataclass
+class TrainingConfig:
+    """统一训练配置"""
+    # 基础参数
+    output_dir: str = "./output"
+    num_train_epochs: int = 3
+    per_device_train_batch_size: int = 4
+    per_device_eval_batch_size: int = 4
+    gradient_accumulation_steps: int = 1
+    max_grad_norm: float = 1.0
+    max_steps: int = -1
+
+    # 学习率
+    learning_rate: float = 5e-5
+    weight_decay: float = 0.01
+    lr_scheduler_type: str = "cosine"
+    warmup_ratio: float = 0.1
+    warmup_steps: int = 0
+
+    # 精度和优化
+    bf16: bool = False  # 自动检测
+    fp16: bool = False
+    gradient_checkpointing: bool = False
+
+    # GPU优化（仅GPU有效）
+    use_flash_attention: bool = False
+    dataloader_num_workers: int = 0
+    dataloader_pin_memory: bool = True
+    dataloader_prefetch_factor: int = 2
+    dataloader_drop_last: bool = True
+
+    # 日志和保存
+    logging_dir: str = "./logs"
+    logging_steps: int = 10
+    save_steps: int = 500
+    save_total_limit: int = 3
+    eval_steps: int = 500
+
+    # 其他
+    seed: int = 42
+    resume_from_checkpoint: Optional[str] = None
+    compute_metrics: Optional[Callable] = None
+
+    # 内部状态
+    _device_type: str = field(default="cpu", init=False, repr=False)
+
+    def __post_init__(self):
+        """自动检测最佳精度"""
+        if torch.cuda.is_available():
+            self._device_type = "cuda"
+            # RTX 40系列 (Ampere+) 支持 BF16
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 8:
+                self.bf16 = True
+                self.fp16 = False
+            else:
+                self.bf16 = False
+                self.fp16 = True
+        else:
+            self._device_type = "cpu"
+            self.bf16 = False
+            self.fp16 = False
+
+
+class PerformanceMonitor:
+    """性能监控器 - 记录各阶段耗时"""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.reset()
+
+    def reset(self):
+        self.timings: Dict[str, List[float]] = {
+            "data_loading": [],
+            "forward": [],
+            "backward": [],
+            "optimizer_step": [],
+            "batch_total": [],
+        }
+        self.step_count = 0
+
+    @contextmanager
+    def measure(self, stage: str):
+        if not self.enabled:
+            yield
+            return
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - start_time
+            self.timings[stage].append(elapsed)
+
+    def record_batch(self, batch_time: float):
+        if self.enabled:
+            self.timings["batch_total"].append(batch_time)
+
+    def get_summary(self) -> Dict[str, Dict[str, float]]:
+        summary = {}
+        for stage, times in self.timings.items():
+            if len(times) > 0:
+                summary[stage] = {
+                    "count": len(times),
+                    "total": sum(times),
+                    "mean": sum(times) / len(times),
+                    "min": min(times),
+                    "max": max(times),
+                }
+            else:
+                summary[stage] = {"count": 0, "total": 0, "mean": 0, "min": 0, "max": 0}
+        return summary
+
+    def print_summary(self):
+        summary = self.get_summary()
+        print("\n" + "=" * 70)
+        print("                      Performance Summary")
+        print("=" * 70)
+        print(f"{'Stage':<20} {'Count':>8} {'Total(s)':>12} {'Mean(ms)':>12} {'Min(ms)':>12} {'Max(ms)':>12}")
+        print("-" * 70)
+
+        for stage, stats in summary.items():
+            if stats["count"] > 0:
+                stage_name = stage.replace("_", " ").title()
+                print(f"{stage_name:<20} {stats['count']:>8} {stats['total']:>12.3f} {stats['mean']*1000:>12.2f} {stats['min']*1000:>12.2f} {stats['max']*1000:>12.2f}")
+
+        print("-" * 70)
+        total_time = sum(s["total"] for s in summary.values())
+        if total_time > 0:
+            print(f"\nTime Breakdown:")
+            for stage, stats in summary.items():
+                if stats["total"] > 0:
+                    pct = stats["total"] / total_time * 100
+                    stage_name = stage.replace("_", " ").title()
+                    print(f"  {stage_name:<18}: {pct:>6.2f}%  ({stats['total']:.3f}s)")
+        print("=" * 70 + "\n")
+
+    def log_step(self, step: int, global_step: int, loss: float, lr: float):
+        if not self.enabled or self.step_count == 0:
+            return
+        summary = self.get_summary()
+        recent = {
+            "data_loading": summary["data_loading"]["mean"] if summary["data_loading"]["count"] > 0 else 0,
+            "forward": summary["forward"]["mean"] if summary["forward"]["count"] > 0 else 0,
+            "backward": summary["backward"]["mean"] if summary["backward"]["count"] > 0 else 0,
+            "batch": summary["batch_total"]["mean"] if summary["batch_total"]["count"] > 0 else 0,
+        }
+        print(f"[Step {global_step}] Loss: {loss:.4f} | LR: {lr:.2e} | "
+              f"Data: {recent['data_loading']*1000:.1f}ms | "
+              f"Fwd: {recent['forward']*1000:.1f}ms | "
+              f"Bwd: {recent['backward']*1000:.1f}ms | "
+              f"Total: {recent['batch']*1000:.1f}ms")
 
 
 class TrainingInterrupted(Exception):
@@ -26,320 +180,158 @@ class TrainingInterrupted(Exception):
 
 class Trainer:
     """
-    训练器主类
-    处理完整的训练流程
+    统一训练器
+    自动检测GPU/CPU并使用最佳配置
     """
 
     def __init__(
         self,
         model: nn.Module,
         train_dataset: Dataset,
+        config: TrainingConfig,
         eval_dataset: Optional[Dataset] = None,
         tokenizer=None,
-        output_dir: str = "./output",
-        num_train_epochs: int = 3,
-        per_device_train_batch_size: int = 4,
-        per_device_eval_batch_size: int = 4,
-        gradient_accumulation_steps: int = 1,
-        learning_rate: float = 5e-5,
-        weight_decay: float = 0.01,
-        max_grad_norm: float = 1.0,
-        lr_scheduler_type: str = "cosine",
-        num_warmup_steps: int = 0,
-        warmup_ratio: float = 0.1,
-        logging_dir: str = "./logs",
-        logging_steps: int = 10,
-        save_steps: int = 500,
-        save_total_limit: int = 3,
-        eval_steps: int = 500,
-        bf16: bool = True,
-        dataloader_num_workers: int = 0,
-        dataloader_drop_last: bool = False,
-        seed: int = 42,
-        resume_from_checkpoint: Optional[str] = None,
         collate_fn: Optional[Callable] = None,
-        compute_metrics: Optional[Callable] = None,
     ):
-        """
-        Args:
-            model: 要训练的模型
-            train_dataset: 训练数据集
-            eval_dataset: 评估数据集
-            tokenizer: tokenizer
-            output_dir: 输出目录
-            num_train_epochs: 训练轮数
-            per_device_train_batch_size: 训练批次大小
-            per_device_eval_batch_size: 评估批次大小
-            gradient_accumulation_steps: 梯度累积步数
-            learning_rate: 学习率
-            weight_decay: 权重衰减
-            max_grad_norm: 梯度裁剪阈值
-            lr_scheduler_type: 学习率调度器类型
-            num_warmup_steps: 预热步数
-            warmup_ratio: 预热比例
-            logging_dir: 日志目录
-            logging_steps: 日志记录步数间隔
-            save_steps: 保存步数间隔
-            save_total_limit: 保存检查点数量限制
-            eval_steps: 评估步数间隔
-            bf16: 是否使用BF16
-            dataloader_num_workers: 数据加载器工作进程数
-            dataloader_drop_last: 是否丢弃最后不完整批次
-            seed: 随机种子
-            resume_from_checkpoint: 恢复训练的检查点路径
-            collate_fn: 数据整理函数
-            compute_metrics: 指标计算函数
-        """
         self.model = model
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
-
-        # 训练配置
-        self.output_dir = output_dir
-        self.num_train_epochs = num_train_epochs
-        self.per_device_train_batch_size = per_device_train_batch_size
-        self.per_device_eval_batch_size = per_device_eval_batch_size
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.max_grad_norm = max_grad_norm
-        self.lr_scheduler_type = lr_scheduler_type
-        self.num_warmup_steps = num_warmup_steps
-        self.warmup_ratio = warmup_ratio
-
-        # 日志和保存配置
-        self.logging_dir = logging_dir
-        self.logging_steps = logging_steps
-        self.save_steps = save_steps
-        self.save_total_limit = save_total_limit
-        self.eval_steps = eval_steps
-
-        # 精度配置
-        self.bf16 = bf16
-
-        # 数据加载配置
-        self.dataloader_num_workers = dataloader_num_workers
-        self.dataloader_drop_last = dataloader_drop_last
-
-        # 其他配置
-        self.seed = seed
-        self.resume_from_checkpoint = resume_from_checkpoint
         self.collate_fn = collate_fn
-        self.compute_metrics = compute_metrics
+        self.config = config
 
-        # 设备 - 自动检测GPU/CPU
-        self.device = get_device()
+        # 自动设备检测
+        self.device = self._setup_device()
+        self.is_gpu = self.device.type == "cuda"
+
+        # 将模型移到设备
         self.model = self.model.to(self.device)
-        print(f"Using device: {self.device}")
+
+        # 混合精度设置
+        self.use_amp = self.is_gpu and (config.bf16 or config.fp16)
+        if config.bf16 and self.is_gpu:
+            self.dtype = torch.bfloat16
+        elif config.fp16 and self.is_gpu:
+            self.dtype = torch.float16
+        else:
+            self.dtype = torch.float32
+
+        # GradScaler for FP16
+        self.scaler = GradScaler() if self.use_amp and config.fp16 else None
+
+        # 性能监控
+        self.perf_monitor = PerformanceMonitor(enabled=True)
+
+        # 训练状态
+        self.global_step = 0
+        self.epoch = 0
+        self.best_loss = float("inf")
+        self.interrupted = False
 
         # 初始化
         self._setup()
 
+    def _setup_device(self) -> torch.device:
+        """设置设备并打印信息"""
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            print(f"\n{'='*60}")
+            print(f"  GPU Training Mode")
+            print(f"{'='*60}")
+            print(f"  Device: {gpu_name}")
+            print(f"  Total Memory: {gpu_memory:.1f} GB")
+            print(f"  Precision: {'BF16' if self.config.bf16 else 'FP16' if self.config.fp16 else 'FP32'}")
+            print(f"{'='*60}\n")
+
+            # 启用TF32 for Ampere+
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 8:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+        else:
+            device = torch.device("cpu")
+            print(f"\n{'='*60}")
+            print(f"  CPU Training Mode")
+            print(f"{'='*60}")
+            print(f"  Device: CPU")
+            print(f"{'='*60}\n")
+
+        return device
+
     def _setup(self):
-        """初始化设置"""
+        """初始化训练组件"""
         # 设置随机种子
-        torch.manual_seed(self.seed)
+        torch.manual_seed(self.config.seed)
 
         # 创建数据加载器
         self.train_dataloader = self._create_dataloader(
             self.train_dataset,
-            self.per_device_train_batch_size,
+            self.config.per_device_train_batch_size,
             shuffle=True,
         )
 
         if self.eval_dataset is not None:
             self.eval_dataloader = self._create_dataloader(
                 self.eval_dataset,
-                self.per_device_eval_batch_size,
+                self.config.per_device_eval_batch_size,
                 shuffle=False,
             )
 
         # 创建优化器
         self.optimizer = create_optimizer(
             self.model,
-            learning_rate=self.learning_rate,
-            weight_decay=self.weight_decay,
+            learning_rate=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
         )
 
         # 计算训练步数
-        self.num_training_steps = len(self.train_dataloader) * self.num_train_epochs
+        num_training_steps = len(self.train_dataloader) * self.config.num_train_epochs
+        if self.config.max_steps > 0:
+            num_training_steps = min(num_training_steps, self.config.max_steps)
 
         # 计算预热步数
-        if self.warmup_ratio > 0:
-            self.num_warmup_steps = int(self.num_training_steps * self.warmup_ratio)
+        num_warmup_steps = (
+            self.config.warmup_steps
+            if self.config.warmup_steps > 0
+            else int(num_training_steps * self.config.warmup_ratio)
+        )
 
         # 创建学习率调度器
         self.scheduler = create_scheduler(
             self.optimizer,
-            scheduler_type=self.lr_scheduler_type,
-            num_training_steps=self.num_training_steps,
-            num_warmup_steps=self.num_warmup_steps,
+            scheduler_type=self.config.lr_scheduler_type,
+            num_training_steps=num_training_steps,
+            num_warmup_steps=num_warmup_steps,
         )
 
         # 检查点管理器
         self.checkpoint_manager = CheckpointManager(
-            self.output_dir,
-            max_checkpoints=self.save_total_limit,
+            self.config.output_dir,
+            max_checkpoints=self.config.save_total_limit,
         )
 
-        # 混合精度
-        self.use_amp = self.bf16 and hasattr(torch, "bfloat16")
-        if self.use_amp:
-            self.dtype = torch.bfloat16
-        else:
-            self.dtype = torch.float32
-
         # 创建输出目录
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(self.logging_dir, exist_ok=True)
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        os.makedirs(self.config.logging_dir, exist_ok=True)
 
-    def _create_dataloader(
-        self,
-        dataset: Dataset,
-        batch_size: int,
-        shuffle: bool = True,
-    ) -> DataLoader:
+    def _create_dataloader(self, dataset: Dataset, batch_size: int, shuffle: bool) -> DataLoader:
         """创建数据加载器"""
+        # IterableDataset 不支持 shuffle
+        if isinstance(dataset, IterableDataset):
+            shuffle = False
+
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=self.dataloader_num_workers,
+            num_workers=self.config.dataloader_num_workers if self.is_gpu else 0,
+            pin_memory=self.config.dataloader_pin_memory if self.is_gpu else False,
+            prefetch_factor=self.config.dataloader_prefetch_factor if self.config.dataloader_num_workers > 0 else None,
             collate_fn=self.collate_fn,
-            drop_last=self.dataloader_drop_last,
-            pin_memory=False,  # CPU训练不需要pin_memory
+            drop_last=self.config.dataloader_drop_last,
         )
-
-    def train(self) -> Dict[str, float]:
-        """
-        执行训练
-
-        Returns:
-            训练结果字典
-        """
-        # 设置信号处理器
-        self.interrupted = False
-        self._setup_signal_handlers()
-
-        # 恢复训练
-        start_epoch = 0
-        start_step = 0
-        global_step = 0
-
-        if self.resume_from_checkpoint:
-            state = self.checkpoint_manager.load(
-                self.resume_from_checkpoint,
-                self.model,
-                self.optimizer,
-                self.scheduler,
-            )
-            start_epoch = state.get("epoch", 0)
-            start_step = state.get("step", 0)
-            global_step = start_step
-
-        # 训练循环
-        total_loss = 0.0
-        best_eval_loss = float("inf")
-        avg_epoch_loss = 0.0
-
-        print(f"Starting training from epoch {start_epoch}, step {start_step}")
-        print(f"Total training steps: {self.num_training_steps}")
-
-        try:
-            for epoch in range(start_epoch, self.num_train_epochs):
-                self.model.train()
-                epoch_loss = 0.0
-                epoch_steps = 0
-
-                progress_bar = tqdm(
-                    enumerate(self.train_dataloader),
-                    total=len(self.train_dataloader),
-                    desc=f"Epoch {epoch + 1}/{self.num_train_epochs}",
-                )
-
-                for step, batch in progress_bar:
-                    # 检查中断
-                    if self.interrupted:
-                        break
-
-                    # 跳过已训练的步数
-                    if epoch == start_epoch and step < start_step % len(self.train_dataloader):
-                        continue
-
-                    # 准备输入
-                    batch = {k: v.to(self.device) for k, v in batch.items()}
-
-                    # 前向传播
-                    with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.use_amp):
-                        outputs = self.model(**batch)
-                        loss = outputs["loss"] / self.gradient_accumulation_steps
-
-                    # 反向传播
-                    loss.backward()
-
-                    total_loss += loss.item()
-                    epoch_loss += loss.item()
-
-                    # 梯度累积
-                    if (step + 1) % self.gradient_accumulation_steps == 0:
-                        # 梯度裁剪
-                        if self.max_grad_norm > 0:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                self.max_grad_norm,
-                            )
-
-                        # 更新参数
-                        self.optimizer.step()
-                        self.scheduler.step()
-                        self.optimizer.zero_grad()
-
-                        global_step += 1
-                        epoch_steps += 1
-
-                        # 日志记录
-                        if global_step % self.logging_steps == 0:
-                            avg_loss = total_loss / self.logging_steps
-                            lr = self.scheduler.get_last_lr()[0]
-                            progress_bar.set_postfix(
-                                loss=f"{avg_loss:.4f}",
-                                lr=f"{lr:.2e}",
-                            )
-                            self._log({"loss": avg_loss, "learning_rate": lr, "step": global_step})
-                            total_loss = 0.0
-
-                        # 保存检查点
-                        if global_step % self.save_steps == 0:
-                            self._save_checkpoint(epoch, global_step)
-
-                        # 评估
-                        if self.eval_dataset is not None and global_step % self.eval_steps == 0:
-                            eval_results = self.evaluate()
-                            if eval_results["loss"] < best_eval_loss:
-                                best_eval_loss = eval_results["loss"]
-                                self._save_checkpoint(epoch, global_step, is_best=True)
-
-                # 每个epoch结束后的平均损失
-                avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
-                print(f"Epoch {epoch + 1} average loss: {avg_epoch_loss:.4f}")
-
-                if self.interrupted:
-                    break
-
-        except Exception as e:
-            print(f"Training interrupted: {e}")
-
-        finally:
-            # 无论是否中断都保存模型
-            print("\nSaving model...")
-            self._save_final_model()
-            if self.interrupted:
-                print(f"Training stopped at step {global_step}")
-            else:
-                print("Training completed successfully!")
-
-        return {"final_loss": avg_epoch_loss, "best_eval_loss": best_eval_loss, "global_step": global_step}
 
     def _setup_signal_handlers(self):
         """设置信号处理器，支持手动终止"""
@@ -349,48 +341,210 @@ class Trainer:
             print("=" * 50)
             self.interrupted = True
 
-        # 注册信号处理器 (Ctrl+C)
         signal.signal(signal.SIGINT, signal_handler)
-        # Windows下也支持Ctrl+Break
         if hasattr(signal, 'SIGBREAK'):
             signal.signal(signal.SIGBREAK, signal_handler)
 
-    def evaluate(self) -> Dict[str, float]:
-        """
-        执行评估
+    def _log(self, metrics: Dict[str, float]):
+        """记录日志"""
+        log_file = os.path.join(self.config.logging_dir, "training_log.txt")
+        with open(log_file, "a") as f:
+            log_line = " | ".join([f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()])
+            f.write(f"{log_line}\n")
 
-        Returns:
-            评估结果字典
-        """
+    def train(self) -> Dict[str, Any]:
+        """执行训练"""
+        self._setup_signal_handlers()
+
+        # 恢复训练
+        start_epoch = 0
+        start_step = 0
+
+        if self.config.resume_from_checkpoint:
+            state = self.checkpoint_manager.load(
+                self.config.resume_from_checkpoint,
+                self.model,
+                self.optimizer,
+                self.scheduler,
+            )
+            start_epoch = state.get("epoch", 0)
+            start_step = state.get("step", 0)
+            self.global_step = start_step
+
+        total_training_steps = len(self.train_dataloader) * self.config.num_train_epochs
+        if self.config.max_steps > 0:
+            total_training_steps = min(total_training_steps, self.config.max_steps)
+
+        print(f"Starting training from epoch {start_epoch}, step {start_step}")
+        print(f"Total training steps: {total_training_steps}")
+
+        total_loss = 0.0
+        best_eval_loss = float("inf")
+        avg_epoch_loss = 0.0
+        start_time = time.time()
+
+        try:
+            for epoch in range(start_epoch, self.config.num_train_epochs):
+                self.model.train()
+                epoch_loss = 0.0
+                epoch_steps = 0
+                self.perf_monitor.reset()
+
+                progress_bar = tqdm(
+                    enumerate(self.train_dataloader),
+                    total=len(self.train_dataloader),
+                    desc=f"Epoch {epoch + 1}/{self.config.num_train_epochs}",
+                )
+
+                for step, batch in progress_bar:
+                    if self.interrupted:
+                        break
+
+                    # 跳过已训练的步
+                    if epoch == start_epoch and step < start_step % len(self.train_dataloader):
+                        continue
+
+                    batch_start_time = time.perf_counter()
+
+                    # 移动数据到设备
+                    with self.perf_monitor.measure("data_loading"):
+                        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                                for k, v in batch.items()}
+
+                    # 前向传播
+                    with self.perf_monitor.measure("forward"):
+                        if self.is_gpu:
+                            with torch.amp.autocast('cuda', dtype=self.dtype, enabled=self.use_amp):
+                                outputs = self.model(**batch)
+                                loss = outputs["loss"] / self.config.gradient_accumulation_steps
+                        else:
+                            outputs = self.model(**batch)
+                            loss = outputs["loss"] / self.config.gradient_accumulation_steps
+
+                    # 反向传播
+                    with self.perf_monitor.measure("backward"):
+                        if self.scaler:
+                            self.scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+
+                    total_loss += loss.item()
+                    epoch_loss += loss.item()
+
+                    # 梯度累积
+                    if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                        # 梯度裁剪
+                        if self.scaler:
+                            self.scaler.unscale_(self.optimizer)
+
+                        if self.config.max_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.config.max_grad_norm,
+                            )
+
+                        # 更新参数
+                        with self.perf_monitor.measure("optimizer_step"):
+                            if self.scaler:
+                                self.scaler.step(self.optimizer)
+                                self.scaler.update()
+                            else:
+                                self.optimizer.step()
+
+                            self.scheduler.step()
+                            self.optimizer.zero_grad()
+
+                        # 记录批次时间
+                        batch_time = time.perf_counter() - batch_start_time
+                        self.perf_monitor.record_batch(batch_time)
+
+                        self.global_step += 1
+                        epoch_steps += 1
+
+                        # 日志
+                        if self.global_step % self.config.logging_steps == 0:
+                            avg_loss = total_loss / self.config.logging_steps
+                            lr = self.optimizer.param_groups[0]["lr"]
+                            progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+                            self.perf_monitor.log_step(step, self.global_step, avg_loss, lr)
+                            self._log({"loss": avg_loss, "learning_rate": lr, "step": self.global_step})
+                            total_loss = 0.0
+
+                        # 保存检查点
+                        if self.global_step % self.config.save_steps == 0:
+                            self._save_checkpoint(epoch, self.global_step)
+
+                        # 评估
+                        if self.eval_dataset is not None and self.global_step % self.config.eval_steps == 0:
+                            eval_results = self.evaluate()
+                            if eval_results["loss"] < best_eval_loss:
+                                best_eval_loss = eval_results["loss"]
+                                self._save_checkpoint(epoch, self.global_step, is_best=True)
+
+                        # 检查最大步数
+                        if self.config.max_steps > 0 and self.global_step >= self.config.max_steps:
+                            break
+
+                avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
+                print(f"Epoch {epoch + 1} average loss: {avg_epoch_loss:.4f}")
+                self.perf_monitor.print_summary()
+
+                if self.interrupted or self.config.max_steps > 0 and self.global_step >= self.config.max_steps:
+                    break
+
+        except Exception as e:
+            print(f"Training error: {e}")
+
+        finally:
+            print("\nSaving model...")
+            self._save_final_model()
+            if self.interrupted:
+                print(f"Training stopped at step {self.global_step}")
+            else:
+                print("Training completed successfully!")
+
+        training_time = time.time() - start_time
+        return {
+            "final_loss": avg_epoch_loss,
+            "best_eval_loss": best_eval_loss,
+            "global_step": self.global_step,
+            "training_time": training_time,
+        }
+
+    @torch.no_grad()
+    def evaluate(self) -> Dict[str, float]:
+        """执行评估"""
         self.model.eval()
         total_loss = 0.0
         total_samples = 0
 
-        with torch.no_grad():
-            for batch in tqdm(self.eval_dataloader, desc="Evaluating"):
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+        for batch in tqdm(self.eval_dataloader, desc="Evaluating"):
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                    for k, v in batch.items()}
 
-                with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=self.use_amp):
+            if self.is_gpu:
+                with torch.amp.autocast('cuda', dtype=self.dtype, enabled=self.use_amp):
                     outputs = self.model(**batch)
                     loss = outputs["loss"]
+            else:
+                outputs = self.model(**batch)
+                loss = outputs["loss"]
 
-                total_loss += loss.item() * batch["input_ids"].size(0)
-                total_samples += batch["input_ids"].size(0)
+            total_loss += loss.item() * batch["input_ids"].size(0)
+            total_samples += batch["input_ids"].size(0)
 
         avg_loss = total_loss / total_samples
         perplexity = math.exp(avg_loss) if avg_loss < 10 else float("inf")
 
         results = {"loss": avg_loss, "perplexity": perplexity}
-
         print(f"Evaluation results: loss={avg_loss:.4f}, perplexity={perplexity:.2f}")
 
-        # 计算额外指标
-        if self.compute_metrics:
-            additional_metrics = self.compute_metrics(results)
+        if self.config.compute_metrics:
+            additional_metrics = self.config.compute_metrics(results)
             results.update(additional_metrics)
 
         self._log(results)
-
+        self.model.train()
         return results
 
     def _save_checkpoint(self, epoch: int, step: int, is_best: bool = False):
@@ -407,26 +561,19 @@ class Trainer:
         )
         print(f"Checkpoint saved at step {step}")
 
+        # 清理GPU缓存
+        if self.is_gpu:
+            torch.cuda.empty_cache()
+
     def _save_final_model(self):
         """保存最终模型"""
-        save_path = os.path.join(self.output_dir, "final_model")
+        save_path = os.path.join(self.config.output_dir, "final_model")
         save_model(self.model, save_path)
         print(f"Final model saved to {save_path}")
 
-    def _log(self, metrics: Dict[str, float]):
-        """记录日志"""
-        log_file = os.path.join(self.logging_dir, "training_log.txt")
-        with open(log_file, "a") as f:
-            log_line = " | ".join([f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()])
-            f.write(f"{log_line}\n")
-
 
 class TrainerState:
-    """
-    训练状态类
-    用于跟踪和恢复训练状态
-    """
-
+    """训练状态类"""
     def __init__(self):
         self.epoch = 0
         self.global_step = 0

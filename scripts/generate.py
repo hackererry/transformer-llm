@@ -89,22 +89,22 @@ def load_model_and_tokenizer(model_path: str, tokenizer_path: str = None):
 
     # 加载tokenizer
     tokenizer_path = tokenizer_path or model_path
-    # 尝试多个可能的tokenizer路径
+    # 优先查找 tokenizer.json（HuggingFace格式）
     tokenizer = None
     for tp in [tokenizer_path, os.path.join(tokenizer_path, "tokenizer"), os.path.join(tokenizer_path, "final_model")]:
         if tp:
             tp = tp.replace("\\", "/")
-            vocab_file = os.path.join(tp, "vocab.json")
-            if os.path.exists(vocab_file) and os.path.getsize(vocab_file) > 0:
+            tokenizer_file = os.path.join(tp, "tokenizer.json")
+            if os.path.exists(tokenizer_file) and os.path.getsize(tokenizer_file) > 0:
                 try:
-                    tokenizer = get_tokenizer(tp, tokenizer_type="bpe")
+                    tokenizer = get_tokenizer(tp, tokenizer_type="bpe", use_fast=True)
+                    print(f"Loaded tokenizer from {tp}")
                     break
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Failed to load tokenizer from {tp}: {e}")
 
     if tokenizer is None:
-        # 创建默认tokenizer
-        print("Warning: Using default tokenizer")
+        print("Warning: No tokenizer found, using default")
         tokenizer = get_tokenizer(None, tokenizer_type="bpe")
 
     return model, tokenizer, config
