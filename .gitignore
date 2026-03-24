@@ -1,0 +1,43 @@
+# Python
+**/__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+
+# Model outputs and checkpoints
+output/
+
+# Preprocessed data
+output/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Local configuration
+.claude/
+
+# Source data (large epub files)
+dataset/orginalData/
+dataset/data/*.epub

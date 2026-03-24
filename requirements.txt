@@ -7,9 +7,9 @@ psutil>=5.9.0
 # 配置文件解析
 pyyaml>=6.0
 
-# 可选依赖 - HuggingFace tokenizers
-# tokenizers>=0.13.0
-# transformers>=4.30.0
+# HuggingFace tokenizers (21x faster BPE)
+tokenizers>=0.13.0
+transformers>=4.30.0
 
 # 可选依赖 - TensorBoard日志
 # tensorboard>=2.12.0
