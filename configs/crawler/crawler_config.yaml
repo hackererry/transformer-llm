@@ -1,0 +1,39 @@
+# 爬虫配置文件
+global:
+  delay: 2.0          # 请求间隔2秒
+  max_pages: 30        # 每个站点最多30页
+  depth: 3             # 爬取深度
+  max_concurrent: 2    # 每个站点最大并发数
+
+sites:
+  - name: cnfin
+    start_url: https://www.cnfin.com/
+    content_type: news
+
+  - name: nbd
+    start_url: https://finance.nbd.com.cn/
+    content_type: news
+
+  - name: yicai
+    start_url: https://www.yicai.com/
+    content_type: news
+  
+  - name: caixin
+    start_url: https://www.caixin.com/
+    content_type: news
+  
+  - name: eeo
+    start_url: https://www.eeo.com.cn/
+    content_type: news
+
+  - name: jrj
+    start_url: https://www.jrj.com.cn/
+    content_type: news
+
+  - name: stcn
+    start_url: https://www.stcn.com/
+    content_type: news
+
+  - name: 10jqka
+    start_url: https://www.10jqka.com.cn/
+    content_type: news

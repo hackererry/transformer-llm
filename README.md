@@ -54,11 +54,20 @@ transformer/
 │   │   ├── memory.py           # 内存优化
 │   │   └── parallel.py         # 并行化支持
 │   │
-│   └── utils/                  # 工具层
-│       ├── __init__.py         # 工具模块导出
-│       ├── device.py           # 设备管理、内存信息
-│       ├── logging.py          # 日志记录
-│       └── metrics.py          # 性能指标计算
+│   ├── utils/                  # 工具层
+│   │   ├── __init__.py         # 工具模块导出
+│   │   ├── device.py           # 设备管理、内存信息
+│   │   ├── logging.py          # 日志记录
+│   │   └── metrics.py          # 性能指标计算
+│   │
+│   └── crawler/                # 专业爬虫系统
+│       ├── __init__.py         # 爬虫模块导出
+│       ├── cli.py              # 命令行接口（run/status）
+│       ├── engine.py           # 爬虫引擎
+│       ├── config.py           # 配置管理
+│       ├── browser/            # 浏览器自动化
+│       ├── anti_crawler/      # 反反爬虫
+│       └── storage/           # 数据存储
 │
 ├── scripts/                     # 训练脚本
 │   ├── preprocess_data.py      # 数据预处理脚本
@@ -71,11 +80,17 @@ transformer/
 │   ├── test_model.py           # 模型模块测试
 │   ├── test_data.py            # 数据模块测试
 │   ├── test_training.py        # 训练模块测试
+│   ├── test_crawler.py         # 爬虫模块测试
 │   └── conftest.py             # pytest配置
 │
 ├── dataset/                     # 数据处理工具
-│   ├── epub_to_txt.py         # EPUB转文本
-│   └── clean_text.py          # 文本清洗
+│   ├── document_converter.py  # 文档格式转换（PDF/CSV/JSON/EPUB）
+│   ├── clean_text.py          # 文本清洗
+│   ├── finetuneData/          # 微调数据样例
+│   └── data/                  # 训练数据
+│
+├── configs/crawler/           # 爬虫配置
+│   └── crawler_config.yaml    # 批量爬取配置
 │
 ├── logs/                        # 训练日志
 ├── output/                      # 输出目录
@@ -98,12 +113,22 @@ transformer/
 | `transformer.py` | `CausalLMModel` | 因果语言模型主类（包含LM head） |
 | `attention.py` | `Attention` | 标准多头注意力机制 |
 | `attention.py` | `FlashAttention` | Flash Attention实现 |
+| `attention.py` | `GroupedQueryAttention` | 分组查询注意力（GQA） |
+| `attention.py` | `CrossAttention` | 交叉注意力（解码器） |
 | `layers.py` | `RMSNorm` | RMS归一化 |
 | `layers.py` | `SwiGLUFFN` | SwiGLU激活的前馈网络 |
 | `layers.py` | `FeedForward` | 标准前馈网络 |
+| `layers.py` | `TransformerMLP` | Transformer MLP层 |
+| `layers.py` | `MLP` | 通用MLP层 |
+| `layers.py` | `LayerNorm` | 层归一化 |
 | `embedding.py` | `RotaryEmbedding` | RoPE旋转位置编码 |
 | `embedding.py` | `apply_rotary_pos_emb` | 应用RoPE编码 |
 | `lm_head.py` | `LMHead` | 语言模型输出头 |
+| `lm_head.py` | `TiedLMHead` | 权重绑定的LM头 |
+| `lm_head.py` | `AdaptiveLMHead` | 自适应LM头 |
+| `lm_head.py` | `MLPHead` | MLP型LM头 |
+| `lm_head.py` | `Pooler` | 池化层 |
+| `lm_head.py` | `SequenceSummary` | 序列摘要层 |
 
 ### 2. 数据层 (src/data/)
 
@@ -115,9 +140,12 @@ transformer/
 | `dataset.py` | `PretrainIterableDataset` | 可迭代形式预训练数据集 |
 | `dataset.py` | `FinetuneDataset` | 指令微调数据集 |
 | `dataset.py` | `TextFileDataset` | 文本文件数据集 |
+| `dataset.py` | `MemoryMappedDataset` | 内存映射数据集（节省内存） |
+| `dataset.py` | `create_dataset` | 数据集工厂函数 |
 | `preprocessed_dataset.py` | `PreprocessedDataset` | 预处理缓存数据集 |
 | `preprocessed_dataset.py` | `ShardedPreprocessedDataset` | 分片预处理数据集（避免OOM） |
 | `preprocessed_dataset.py` | `save_preprocessed_data` | 保存预处理数据 |
+| `preprocessed_dataset.py` | `create_sharded_dataset` | 创建分片数据集 |
 | `collator.py` | `DataCollatorForCausalLM` | 因果LM数据整理器 |
 | `collator.py` | `DataCollatorForSFT` | SFT数据整理器 |
 | `collator.py` | `DynamicBatchSampler` | 动态批采样器 |
@@ -150,9 +178,59 @@ transformer/
 | `device.py` | `set_seed` | 设置随机种子 |
 | `device.py` | `get_memory_info` | 获取内存信息 |
 | `device.py` | `print_device_info` | 打印设备信息 |
+| `device.py` | `DeviceManager` | 设备管理器 |
+| `device.py` | `get_device_info` | 获取设备详细信息 |
+| `device.py` | `to_device` | 数据迁移到设备 |
+| `device.py` | `enable_tf32` | 启用TF32计算 |
+| `device.py` | `set_num_threads` | 设置CPU线程数 |
+| `device.py` | `get_optimal_num_threads` | 获取最优线程数 |
 | `logging.py` | `setup_logger` | 设置日志记录 |
+| `logging.py` | `Logger` | 日志类 |
+| `logging.py` | `TensorBoardLogger` | TensorBoard日志 |
+| `logging.py` | `ProgressTracker` | 进度跟踪器 |
 | `metrics.py` | `compute_perplexity` | 计算困惑度 |
 | `metrics.py` | `compute_accuracy` | 计算准确率 |
+| `metrics.py` | `compute_bleu_score` | 计算BLEU分数 |
+| `metrics.py` | `compute_f1_score` | 计算F1分数 |
+| `metrics.py` | `MetricsTracker` | 指标跟踪器 |
+
+### 5. CPU优化层 (src/cpu_optim/)
+
+| 文件 | 类/函数 | 说明 |
+|------|---------|------|
+| `gradient_checkpoint.py` | `gradient_checkpoint` | 梯度检查点装饰器 |
+| `gradient_checkpoint.py` | `CheckpointedModule` | 检查点模块封装 |
+| `gradient_checkpoint.py` | `CheckpointedSequential` | 顺序模块检查点封装 |
+| `gradient_checkpoint.py` | `SelectiveCheckpoint` | 选择性检查点 |
+| `gradient_checkpoint.py` | `enable_gradient_checkpointing` | 启用梯度检查点 |
+| `gradient_checkpoint.py` | `estimate_memory_savings` | 估算内存节省 |
+| `memory.py` | `MemoryMonitor` | 内存监控器 |
+| `memory.py` | `MemoryOptimizer` | 内存优化器 |
+| `memory.py` | `Offloader` | CPU卸载器 |
+| `memory.py` | `optimize_for_cpu_training` | CPU训练内存优化 |
+| `memory.py` | `memory_context` | 内存上下文管理器 |
+| `parallel.py` | `ParallelDataLoader` | 并行数据加载器 |
+| `parallel.py` | `ChunkedBatchSampler` | 分块批采样器 |
+| `parallel.py` | `BucketBatchSampler` | 桶式批采样器 |
+| `parallel.py` | `ParallelProcessor` | 并行处理器 |
+| `parallel.py` | `get_optimal_num_workers` | 获取最优工作进程数 |
+| `parallel.py` | `create_dataloader` | 数据加载器工厂函数 |
+
+### 6. 爬虫系统 (src/crawler/)
+
+| 文件 | 类/函数 | 说明 |
+|------|---------|------|
+| `cli.py` | `main` | 命令行入口（run/status） |
+| `engine.py` | `crawl_sites` | 批量爬取站点 |
+| `config.py` | `CrawlerConfig` | 爬虫配置类 |
+| `config.py` | `CrawlerSettings` | 爬虫设置类 |
+| `browser/playwright_manager.py` | `PlaywrightManager` | Playwright浏览器管理器 |
+| `browser/page_interactions.py` | `PageInteractions` | 页面交互操作 |
+| `anti_crawler/fingerprint.py` | `FingerprintGenerator` | 浏览器指纹生成 |
+| `anti_crawler/proxy_pool.py` | `ProxyPool` | 代理池管理 |
+| `anti_crawler/user_agent_pool.py` | `UserAgentPool` | User-Agent池 |
+| `storage/database.py` | `Database` | SQLite数据库存储 |
+| `storage/file_storage.py` | `FileStorage` | 文件存储管理器 |
 
 ---
 
@@ -267,6 +345,191 @@ python scripts/generate.py \
     --top_p 0.9 \
     --do_sample
 ```
+
+---
+
+## 数据预处理与爬虫工具
+
+### 目录结构
+
+| 目录 | 说明 |
+|------|------|
+| `dataset/` | 数据处理工具 |
+| `src/crawler/` | 专业爬虫系统 |
+
+### 1. 文档格式转换 (`dataset/document_converter.py`)
+
+支持 PDF、CSV、JSON、EPUB 格式转换为纯文本。
+
+**功能特性：**
+- 支持多种文档格式（PDF, CSV, JSON, EPUB）
+- 支持单个文件转换
+- 支持批量目录转换
+- 自动提取元数据
+- 支持合并多个文件
+
+**使用方法：**
+
+```bash
+# 转换单个文件
+python dataset/document_converter.py book.epub
+python dataset/document_converter.py document.pdf
+python dataset/document_converter.py data.csv
+python dataset/document_converter.py data.json
+
+# 指定输出路径
+python dataset/document_converter.py book.epub -o output.txt
+
+# 批量转换目录
+python dataset/document_converter.py -d ./documents -o ./txt_output
+
+# 批量转换并合并为一个文件
+python dataset/document_converter.py -d ./documents --merge merged_training.txt
+```
+
+### 2. 文本清洗 (`dataset/clean_text.py`)
+
+对转换后的文本进行清洗和预处理。
+
+**功能特性：**
+- 移除多余空白
+- 修复编码问题
+- 移除页码
+- 移除URL/邮箱
+- 分割大文件
+
+**使用方法：**
+
+```bash
+# 清洗文本文件
+python dataset/clean_text.py clean input.txt -o cleaned.txt
+
+# 清洗并移除URL和邮箱
+python dataset/clean_text.py clean input.txt --remove-urls --remove-emails
+
+# 分割大文件
+python dataset/clean_text.py split large.txt -o ./chunks --max-chars 1000000
+```
+
+### 3. 网络爬虫 (`src/crawler/cli.py`)
+
+从互联网批量爬取文本数据用于大模型预训练。
+
+**功能特性：**
+- 多站点批量爬取
+- 自动文本清洗
+- robots.txt 合规检查
+- 异步爬取支持（高性能）
+- 统一SQLite数据库存储
+- 断点续爬支持
+
+**使用方法：**
+
+```bash
+# 批量爬取（使用默认配置）
+python -m src.crawler.cli run
+
+# 指定配置文件和并行数
+python -m src.crawler.cli run --config configs/crawler/crawler_config.yaml --parallel 3
+
+# 指定输出目录
+python -m src.crawler.cli run --output-dir ./output/crawled --parallel 2
+
+# 查看爬虫状态
+python -m src.crawler.cli status
+
+# 指定输出目录查看状态
+python -m src.crawler.cli status --output-dir ./output/crawled
+```
+
+**配置文件格式（YAML）：**
+
+```yaml
+global:
+  delay: 2.0          # 请求间隔（秒）
+  max_pages: 30       # 每个站点最多爬取页数
+  depth: 3             # 爬取深度
+  max_concurrent: 2    # 每个站点最大并发数
+
+sites:
+  - name: cnfin
+    start_url: https://www.cnfin.com/
+    max_pages: 30
+    content_type: news
+    delay: 2.0
+
+  - name: nbd
+    start_url: https://finance.nbd.com.cn/
+    max_pages: 30
+    content_type: news
+    delay: 2.0
+```
+
+**内容类型说明：**
+
+| 类型 | 说明 |
+|------|------|
+| `news` | 新闻资讯类，自动提取正文 |
+| `novel` | 小说/文学类，保留段落格式 |
+| `wiki` | 百科/知识类，提取主要内容 |
+| `auto` | 自动检测（默认） |
+
+### 完整数据准备流程
+
+```bash
+# 方式一：从文档准备数据
+# 1. 转换文档为TXT
+python dataset/document_converter.py -d ./raw_documents --merge raw_data.txt
+
+# 2. 清洗文本
+python dataset/clean_text.py clean raw_data.txt -o cleaned_data.txt
+
+# 3. (可选) 分割大文件
+python dataset/clean_text.py split cleaned_data.txt -o ./train_chunks
+
+# 方式二：从网络爬取数据
+# 1. 爬取网站内容（使用配置文件批量爬取）
+python -m src.crawler.cli run --config configs/crawler/crawler_config.yaml --parallel 2
+
+# 2. 清洗爬取结果（爬虫已自动清洗，可视需要进一步处理）
+python dataset/clean_text.py clean ./crawled/example_com.txt -o cleaned_data.txt
+
+# 开始预训练
+python scripts/preprocess_data.py --train_file cleaned_data.txt --output_dir output/preprocessed
+```
+
+### 支持的输入格式
+
+| 格式 | 工具 | 说明 |
+|------|------|------|
+| `.pdf`, `.csv`, `.json`, `.epub` | document_converter.py | 文档格式转换 |
+| `.txt` | clean_text.py | 纯文本（需清洗） |
+| YAML配置 | src/crawler/cli.py | 批量网络爬取 |
+
+### 输出格式
+
+所有工具输出的都是纯文本格式 (`.txt`)，每行一段文本，可直接用于预训练：
+
+```
+这是第一段内容。
+
+这是第二段内容。
+
+...
+```
+
+### 注意事项
+
+1. **EPUB文件**: 确保EPUB文件没有DRM保护
+2. **编码**: 工具会自动处理UTF-8编码
+3. **大文件**: 建议分割成小于1GB的文件
+4. **版权**: 仅转换您有权使用的内容
+5. **网络爬虫**:
+   - 配置文件位于 `configs/crawler/crawler_config.yaml`
+   - 遵守 robots.txt 规则（默认开启）
+   - 设置合理的请求延迟，避免对服务器造成压力
+   - 仅爬取公开、允许爬取的内容
+   - 确保有权使用爬取的内容进行训练
 
 ---
 
@@ -460,6 +723,7 @@ pytest tests/ -v
 pytest tests/test_model.py -v
 pytest tests/test_data.py -v
 pytest tests/test_training.py -v
+pytest tests/test_crawler.py -v
 
 # 运行特定测试类
 pytest tests/test_model.py::TestModelConfig -v
@@ -481,6 +745,7 @@ pytest tests/ --cov=src --cov-report=html
 | `tests/test_model.py` | 模型配置、Transformer、注意力机制、RoPE、生成 |
 | `tests/test_data.py` | Tokenizer、数据整理器、动态批采样 |
 | `tests/test_training.py` | 优化器、调度器、检查点管理、训练器 |
+| `tests/test_crawler.py` | 爬虫配置、解析器、文本提取、数据库 |
 | `tests/conftest.py` | pytest配置和共享fixture |
 
 ### 测试用例列表
@@ -521,6 +786,18 @@ pytest tests/ --cov=src --cov-report=html
   - 保存加载、最佳模型
 - `TestTrainer`: 训练器测试
   - 训练器创建
+
+#### test_crawler.py
+
+- `TestCrawlerConfig`: 爬虫配置测试
+- `TestSiteConfig`: 站点配置测试
+- `TestRobotChecker`: robots.txt检查测试
+- `TestTextExtractor`: 文本提取测试
+  - 标题提取、正文提取、噪声移除
+- `TestAsyncCrawler`: 异步爬虫测试
+  - URL验证、链接提取、文本清洗
+- `TestCrawlResult`: 爬取结果测试
+- `TestCrawlerIntegration`: 爬虫集成测试
 
 ---
 

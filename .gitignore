@@ -5,6 +5,7 @@
 *.pyo
 *.pyd
 .Python
+.pytest_cache
 
 # Virtual environments
 venv/
@@ -22,6 +23,7 @@ env/
 
 # Logs
 logs/
+logs_sft/
 
 # Model outputs and checkpoints
 output/

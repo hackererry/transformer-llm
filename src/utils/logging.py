@@ -81,6 +81,10 @@ class Logger:
         """记录ERROR级别日志"""
         self.logger.error(message)
 
+    def debug(self, message: str):
+        """记录DEBUG级别日志"""
+        self.logger.debug(message)
+
     def log_metrics(
         self,
         metrics: Dict[str, float],

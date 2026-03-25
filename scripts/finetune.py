@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.model import ModelConfig, CausalLMModel
 from src.data import FinetuneDataset, get_collator, get_tokenizer
-from src.training import Trainer, save_pretrained, load_model
+from src.training import Trainer, TrainingConfig, save_pretrained, load_model
 from src.utils import setup_logger, set_seed, print_device_info
 
 
@@ -98,7 +98,17 @@ def main():
             config = ModelConfig.tiny()
 
         model = CausalLMModel(config)
-        load_model(model, os.path.join(args.model_path, "pytorch_model.bin"))
+        # 优先尝试加载 internal format (.pt)
+        pt_path = os.path.join(args.model_path, "final_model.pt")
+        bin_path = os.path.join(args.model_path, "pytorch_model.bin")
+        if os.path.exists(pt_path):
+            load_model(model, pt_path)
+        elif os.path.exists(bin_path):
+            # HuggingFace 格式直接加载
+            state = torch.load(bin_path, map_location="cpu")
+            model.load_state_dict(state, strict=False)
+        else:
+            raise FileNotFoundError(f"No model file found in {args.model_path}")
     else:
         logger.info(f"Creating new model with {args.model_config} config")
         if args.model_config == "tiny":
@@ -156,29 +166,36 @@ def main():
         max_length=args.max_seq_length,
     )
 
-    # 创建训练器
-    trainer = Trainer(
-        model=model,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
+    # 创建训练配置
+    training_config = TrainingConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
         lr_scheduler_type=args.lr_scheduler_type,
         warmup_ratio=args.warmup_ratio,
+        bf16=args.bf16,
+        gradient_checkpointing=args.gradient_checkpointing,
+        dataloader_num_workers=args.num_workers,
         logging_dir=args.logging_dir,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
-        bf16=args.bf16,
-        dataloader_num_workers=args.num_workers,
         seed=args.seed,
         resume_from_checkpoint=args.resume_from_checkpoint,
+    )
+
+    # 创建训练器
+    trainer = Trainer(
+        model=model,
+        train_dataset=train_dataset,
+        config=training_config,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
         collate_fn=collate_fn,
     )
 
