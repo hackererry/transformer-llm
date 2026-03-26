@@ -11,6 +11,7 @@
 | **文本生成** | 支持多种解码策略的文本生成 |
 | **模型续训** | 支持加载已有模型继续训练 |
 | **断点续训** | 支持从检查点恢复训练 |
+| **增量预处理** | 只处理变化的文件，支持新增/修改/删除检测 |
 | **CPU优化** | BF16混合精度、梯度检查点、内存优化 |
 | **GPU优化** | BF16/FP16混合精度、Flash Attention、梯度累积 |
 | **中文支持** | BPE分词器原生支持中文字符 |
@@ -48,6 +49,11 @@ transformer/
 │   │   ├── optimizer.py        # AdamW/LAMB - 优化器
 │   │   ├── scheduler.py        # CosineAnnealing/Linear - 学习率调度
 │   │   └── checkpoint.py        # CheckpointManager - 检查点管理
+│   │
+│   ├── data_processing/         # 数据清洗层 - 文本清洗和文档转换
+│   │   ├── __init__.py          # 数据清洗模块导出
+│   │   ├── clean_text.py        # TextCleaner - 文本清洗工具
+│   │   └── document_converter.py # 文档格式转换（PDF/CSV/JSON/EPUB）
 │   │
 │   ├── cpu_optim/              # CPU优化模块
 │   │   ├── gradient_checkpoint.py  # 梯度检查点
@@ -170,7 +176,23 @@ transformer/
 | `checkpoint.py` | `load_model` | 加载模型 |
 | `checkpoint.py` | `save_pretrained` | 以HuggingFace格式保存 |
 
-### 4. 工具层 (src/utils/)
+### 4. 数据清洗层 (src/data_processing/)
+
+| 文件 | 类/函数 | 说明 |
+|------|---------|------|
+| `clean_text.py` | `TextCleaner` | 文本清洗器类 |
+| `clean_text.py` | `clean_file()` | 清洗单个文件 |
+| `clean_text.py` | `split_large_file()` | 分割大文件 |
+| `clean_text.py` | `batch_clean_directory()` | 批量清洗目录 |
+| `document_converter.py` | `convert_to_txt()` | 单文件格式转换 |
+| `document_converter.py` | `batch_convert()` | 批量转换（支持并发） |
+| `document_converter.py` | `merge_txt_files()` | 合并多个TXT文件 |
+| `document_converter.py` | `PDFExtractor` | PDF文本提取器 |
+| `document_converter.py` | `CSVExtractor` | CSV文本提取器 |
+| `document_converter.py` | `JSONExtractor` | JSON文本提取器 |
+| `document_converter.py` | `EPUBExtractor` | EPUB电子书提取器 |
+
+### 5. 工具层 (src/utils/)
 
 | 文件 | 类/函数 | 说明 |
 |------|---------|------|
@@ -194,7 +216,7 @@ transformer/
 | `metrics.py` | `compute_f1_score` | 计算F1分数 |
 | `metrics.py` | `MetricsTracker` | 指标跟踪器 |
 
-### 5. CPU优化层 (src/cpu_optim/)
+### 6. CPU优化层 (src/cpu_optim/)
 
 | 文件 | 类/函数 | 说明 |
 |------|---------|------|
@@ -216,7 +238,7 @@ transformer/
 | `parallel.py` | `get_optimal_num_workers` | 获取最优工作进程数 |
 | `parallel.py` | `create_dataloader` | 数据加载器工厂函数 |
 
-### 6. 爬虫系统 (src/crawler/)
+### 7. 爬虫系统 (src/crawler/)
 
 | 文件 | 类/函数 | 说明 |
 |------|---------|------|
@@ -268,12 +290,48 @@ python scripts/preprocess_data.py \
     --validation_file dataset/data/val.txt \
     --output_dir output/preprocessed
 
-# 强制重新处理
+# 方式4: 增量添加新数据（默认模式）
+python scripts/preprocess_data.py \
+    --train_dir dataset/data \
+    --output_dir output/preprocessed
+
+# 方式5: 查看变化但不处理（dry-run）
 python scripts/preprocess_data.py \
     --train_dir dataset/data \
     --output_dir output/preprocessed \
-    --force_reprocess
+    --dry-run
+
+# 方式6: 完全重新处理
+python scripts/preprocess_data.py \
+    --train_dir dataset/data \
+    --output_dir output/preprocessed \
+    --full
+
+# 方式7: Tokenizer 扩展模式
+python scripts/preprocess_data.py \
+    --train_dir dataset/data \
+    --output_dir output/preprocessed \
+    --tokenizer-mode extend
 ```
+
+#### 增量预处理功能 (v3.0)
+
+数据预处理脚本支持增量处理，避免重复处理未变化的数据：
+
+| 场景 | 行为 |
+|------|------|
+| **新增文件** | 只处理新文件，追加分片 |
+| **修改文件** | 删除旧分片，重新处理该文件 |
+| **删除文件** | 保留已处理分片，标记为 `orphaned` |
+| **文件未变化** | 跳过处理 |
+
+**Tokenizer 处理模式：**
+
+| 模式 | 说明 |
+|------|------|
+| `frozen` | 使用现有 tokenizer（默认） |
+| `extend` | 检测新词汇，必要时扩展词表（触发全量重处理） |
+| `retrain` | 重新训练 tokenizer（触发全量重处理） |
 
 ### 2. 预训练（自动检测GPU/CPU）
 
@@ -365,6 +423,7 @@ python scripts/generate.py \
 - 支持多种文档格式（PDF, CSV, JSON, EPUB）
 - 支持单个文件转换
 - 支持批量目录转换
+- **支持并发转换**（自动使用 CPU 核数）
 - 自动提取元数据
 - 支持合并多个文件
 
@@ -372,22 +431,24 @@ python scripts/generate.py \
 
 ```bash
 # 转换单个文件
-python dataset/document_converter.py book.epub
-python dataset/document_converter.py document.pdf
-python dataset/document_converter.py data.csv
-python dataset/document_converter.py data.json
+python -m src.data_processing.document_converter book.epub
+python -m src.data_processing.document_converter document.pdf
+python -m src.data_processing.document_converter data.csv
+python -m src.data_processing.document_converter data.json
 
 # 指定输出路径
-python dataset/document_converter.py book.epub -o output.txt
-
-# 批量转换目录
-python dataset/document_converter.py -d ./documents -o ./txt_output
-
+python -m src.data_processing.document_converter book.epub -o output.txt
+# 批量转换目录（默认使用 CPU 核数并发）
+python -m src.data_processing.document_converter -d ./documents -o ./txt_output
+# 指定并发线程数
+python -m src.data_processing.document_converter -d ./documents -w 4
+# 串行模式（单线程）
+python -m src.data_processing.document_converter -d ./documents -w 1
 # 批量转换并合并为一个文件
-python dataset/document_converter.py -d ./documents --merge merged_training.txt
+python -m src.data_processing.document_converter -d ./documents --merge merged_training.txt
 ```
 
-### 2. 文本清洗 (`dataset/clean_text.py`)
+### 2. 文本清洗 (`src/data_processing/clean_text.py`)
 
 对转换后的文本进行清洗和预处理。
 
@@ -402,13 +463,13 @@ python dataset/document_converter.py -d ./documents --merge merged_training.txt
 
 ```bash
 # 清洗文本文件
-python dataset/clean_text.py clean input.txt -o cleaned.txt
+python -m src.data_processing.clean_text clean input.txt -o cleaned.txt
 
 # 清洗并移除URL和邮箱
-python dataset/clean_text.py clean input.txt --remove-urls --remove-emails
+python -m src.data_processing.clean_text clean input.txt --remove-urls --remove-emails
 
 # 分割大文件
-python dataset/clean_text.py split large.txt -o ./chunks --max-chars 1000000
+python -m src.data_processing.clean_text split large.txt -o ./chunks --max-chars 1000000
 ```
 
 ### 3. 网络爬虫 (`src/crawler/cli.py`)
@@ -479,20 +540,20 @@ sites:
 ```bash
 # 方式一：从文档准备数据
 # 1. 转换文档为TXT
-python dataset/document_converter.py -d ./raw_documents --merge raw_data.txt
+python -m src.data_processing.document_converter -d ./raw_documents --merge raw_data.txt
 
 # 2. 清洗文本
-python dataset/clean_text.py clean raw_data.txt -o cleaned_data.txt
+python -m src.data_processing.clean_text clean raw_data.txt -o cleaned_data.txt
 
 # 3. (可选) 分割大文件
-python dataset/clean_text.py split cleaned_data.txt -o ./train_chunks
+python -m src.data_processing.clean_text split cleaned_data.txt -o ./train_chunks
 
 # 方式二：从网络爬取数据
 # 1. 爬取网站内容（使用配置文件批量爬取）
 python -m src.crawler.cli run --config configs/crawler/crawler_config.yaml --parallel 2
 
 # 2. 清洗爬取结果（爬虫已自动清洗，可视需要进一步处理）
-python dataset/clean_text.py clean ./crawled/example_com.txt -o cleaned_data.txt
+python -m src.data_processing.clean_text clean ./crawled/example_com.txt -o cleaned_data.txt
 
 # 开始预训练
 python scripts/preprocess_data.py --train_file cleaned_data.txt --output_dir output/preprocessed
@@ -502,9 +563,9 @@ python scripts/preprocess_data.py --train_file cleaned_data.txt --output_dir out
 
 | 格式 | 工具 | 说明 |
 |------|------|------|
-| `.pdf`, `.csv`, `.json`, `.epub` | document_converter.py | 文档格式转换 |
-| `.txt` | clean_text.py | 纯文本（需清洗） |
-| YAML配置 | src/crawler/cli.py | 批量网络爬取 |
+| `.pdf`, `.csv`, `.json`, `.epub` | src.data_processing.document_converter | 文档格式转换 |
+| `.txt` | src.data_processing.clean_text | 纯文本（需清洗） |
+| YAML配置 | src.crawler.cli | 批量网络爬取 |
 
 ### 输出格式
 
@@ -548,7 +609,11 @@ python scripts/preprocess_data.py --train_file cleaned_data.txt --output_dir out
 | `--min_frequency` | 2 | BPE最小频率 |
 | `--shard_size` | 10000 | 每个分片的样本数量 |
 | `--tokenizer_sample_bytes` | 100MB | 用于训练tokenizer的采样字节数 |
-| `--force_reprocess` | False | 强制重新处理 |
+| `--incremental` | True | 启用增量处理模式（默认） |
+| `--full` | False | 完全重新处理所有数据 |
+| `--dry-run` | False | 仅检测变化，不实际处理 |
+| `--tokenizer-mode` | frozen | Tokenizer 模式: frozen/extend/retrain |
+| `--force_reprocess` | False | 强制重新处理（等同于 --full） |
 
 ### pretrain.py 参数
 
@@ -692,7 +757,51 @@ output/preprocessed/
 └── dataset_info.json     # 数据集元信息
 ```
 
-缓存格式（.pt文件）：
+### dataset_info.json v3.0 格式
+
+```json
+{
+  "version": "3.0",
+  "config": {
+    "max_seq_length": 512,
+    "vocab_size": 32000,
+    "min_frequency": 2,
+    "shard_size": 10000
+  },
+  "files": {
+    "file1.txt": {
+      "hash": "md5...",
+      "status": "processed",
+      "shards": ["train_000.pt"],
+      "num_examples": 5000
+    }
+  },
+  "shards": {
+    "train_000.pt": {
+      "index": 0,
+      "source_files": ["file1.txt"],
+      "num_examples": 5000
+    }
+  },
+  "summary": {
+    "total_files": 1,
+    "total_shards": 1,
+    "total_examples": 5000,
+    "next_shard_index": 1
+  }
+}
+```
+
+**文件状态说明：**
+
+| 状态 | 说明 |
+|------|------|
+| `processed` | 已正常处理 |
+| `legacy` | 从 v2.0 迁移的遗留数据 |
+| `orphaned` | 源文件已删除，但分片保留 |
+
+### 缓存格式（.pt文件）
+
 ```python
 {
     "version": "1.0",
@@ -700,7 +809,7 @@ output/preprocessed/
         "max_seq_length": 512,
         "vocab_size": 32000,
         "num_examples": 10000,
-        "original_file": "train.txt",
+        "source_files": ["train.txt"],
     },
     "examples": [
         {"input_ids": [...], "labels": [...]},

@@ -43,3 +43,4 @@ build/
 # Source data (large epub files)
 dataset/orginalData/
 dataset/data/*.epub
+dataset/data/20260325/

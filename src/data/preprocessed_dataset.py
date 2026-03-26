@@ -111,6 +111,7 @@ def save_preprocessed_data(
     output_path: str,
     metadata: Dict[str, Any],
     version: str = "1.0",
+    source_files: Optional[List[str]] = None,
 ) -> None:
     """
     保存预处理好的数据为缓存格式
@@ -120,7 +121,13 @@ def save_preprocessed_data(
         output_path: 输出文件路径
         metadata: 元数据字典
         version: 缓存版本
+        source_files: 源文件列表（v3.0 增量处理支持）
     """
+    # 如果 metadata 中没有 source_files 且提供了参数，则添加
+    if source_files and "source_files" not in metadata:
+        metadata = metadata.copy()
+        metadata["source_files"] = source_files
+
     data = {
         "version": version,
         "metadata": metadata,

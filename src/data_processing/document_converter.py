@@ -8,10 +8,12 @@ import re
 import sys
 import zipfile
 import argparse
+import threading
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from html import unescape
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from pathlib import Path
 
 
@@ -582,13 +584,73 @@ def epub_to_txt(epub_path: str, output_path: Optional[str] = None) -> str:
     return output_path
 
 
-def batch_convert(input_dir: str, output_dir: Optional[str] = None) -> List[str]:
+def _convert_single_file(
+    input_path: str,
+    output_dir: str,
+    file_idx: int,
+    total_files: int,
+    print_lock: threading.Lock
+) -> Tuple[str, bool, str]:
     """
-    批量转换目录下的所有支持格式的文件
+    转换单个文件（用于并发调用）
+
+    Args:
+        input_path: 输入文件路径
+        output_dir: 输出目录
+        file_idx: 文件序号
+        total_files: 总文件数
+        print_lock: 打印锁
+
+    Returns:
+        (输入路径, 是否成功, 输出路径或错误信息)
+    """
+    try:
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
+        output_path = os.path.join(output_dir, f"{base_name}.txt")
+
+        with print_lock:
+            print(f"[{file_idx}/{total_files}] 正在处理: {os.path.basename(input_path)}")
+
+        # 使用对应的提取器
+        ext = os.path.splitext(input_path)[1].lower()
+        extractor = EXTRACTORS[ext](input_path)
+        text, metadata = extractor.extract()
+
+        # 写入文件
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+        with print_lock:
+            info_parts = []
+            if metadata.get('title'):
+                info_parts.append(f"标题: {metadata.get('title')}")
+            if metadata.get('author'):
+                info_parts.append(f"作者: {metadata.get('author')}")
+            if metadata.get('record_count'):
+                info_parts.append(f"记录数: {metadata.get('record_count')}")
+            info_parts.append(f"字数: {len(text):,}")
+            print(f"[{file_idx}/{total_files}] 完成: {info_parts[0] if info_parts else os.path.basename(input_path)}")
+
+        return (input_path, True, output_path)
+
+    except Exception as e:
+        with print_lock:
+            print(f"[{file_idx}/{total_files}] 失败: {os.path.basename(input_path)} - {e}")
+        return (input_path, False, str(e))
+
+
+def batch_convert(
+    input_dir: str,
+    output_dir: Optional[str] = None,
+    max_workers: Optional[int] = None
+) -> List[str]:
+    """
+    批量转换目录下的所有支持格式的文件（支持并发）
 
     Args:
         input_dir: 输入目录
         output_dir: 输出目录（可选）
+        max_workers: 最大并发线程数（默认为 CPU 核数）
 
     Returns:
         转换成功的文件列表
@@ -599,6 +661,10 @@ def batch_convert(input_dir: str, output_dir: Optional[str] = None) -> List[str]
         os.makedirs(output_dir, exist_ok=True)
     else:
         output_dir = input_dir
+
+    # 默认使用 CPU 核数
+    if max_workers is None:
+        max_workers = os.cpu_count() or 4
 
     # 查找所有支持的文件
     supported_files = []
@@ -612,22 +678,39 @@ def batch_convert(input_dir: str, output_dir: Optional[str] = None) -> List[str]
         print(f"在 {input_dir} 中未找到支持格式的文件 ({supported})")
         return []
 
-    print(f"找到 {len(supported_files)} 个支持格式的文件")
+    total_files = len(supported_files)
+    print(f"找到 {total_files} 个支持格式的文件")
+    print(f"并发线程数: {max_workers}")
     print("=" * 50)
 
     success_files = []
-    failed_files = []
+    failed_files: Dict[str, str] = {}  # 文件路径 -> 错误信息
+    print_lock = threading.Lock()
 
-    for idx, input_path in enumerate(supported_files, 1):
-        print(f"\n[{idx}/{len(supported_files)}]")
-        try:
-            base_name = os.path.splitext(os.path.basename(input_path))[0]
-            output_path = os.path.join(output_dir, f"{base_name}.txt")
-            convert_to_txt(input_path, output_path)
-            success_files.append(output_path)
-        except Exception as e:
-            print(f"  错误: {e}")
-            failed_files.append(input_path)
+    # 使用线程池并发处理
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for idx, input_path in enumerate(supported_files, 1):
+            future = executor.submit(
+                _convert_single_file,
+                input_path,
+                output_dir,
+                idx,
+                total_files,
+                print_lock
+            )
+            futures[future] = input_path
+
+        # 收集结果
+        for future in as_completed(futures):
+            input_path, success, result = future.result()
+            if success:
+                success_files.append(result)
+            else:
+                failed_files[input_path] = result
+
+    # 按文件序号排序输出列表
+    success_files.sort()
 
     # 打印总结
     print("\n" + "=" * 50)
@@ -635,8 +718,8 @@ def batch_convert(input_dir: str, output_dir: Optional[str] = None) -> List[str]
 
     if failed_files:
         print("\n失败的文件:")
-        for f in failed_files:
-            print(f"  - {f}")
+        for f, err in failed_files.items():
+            print(f"  - {os.path.basename(f)}: {err}")
 
     return success_files
 
@@ -682,8 +765,14 @@ def main():
   # 指定输出路径
   python document_converter.py book.epub -o output.txt
 
-  # 批量转换目录
+  # 批量转换目录（默认使用CPU核数并发）
   python document_converter.py -d /path/to/documents -o /path/to/output
+
+  # 指定并发线程数
+  python document_converter.py -d /path/to/documents -w 4
+
+  # 串行模式（单线程）
+  python document_converter.py -d /path/to/documents -w 1
 
   # 批量转换并合并为一个文件
   python document_converter.py -d /path/to/documents --merge merged.txt
@@ -693,13 +782,15 @@ def main():
     parser.add_argument("input", nargs="?", help=f"输入文件路径 ({supported_formats})")
     parser.add_argument("-o", "--output", help="输出TXT文件或目录路径")
     parser.add_argument("-d", "--dir", help="批量转换的输入目录")
+    parser.add_argument("-w", "--workers", type=int, default=None,
+                        help="并发线程数 (默认: CPU核数)")
     parser.add_argument("--merge", metavar="OUTPUT_FILE", help="合并所有转换结果为一个文件")
 
     args = parser.parse_args()
 
     if args.dir:
         # 批量转换模式
-        txt_files = batch_convert(args.dir, args.output)
+        txt_files = batch_convert(args.dir, args.output, args.workers)
 
         if args.merge and txt_files:
             merge_txt_files(txt_files, args.merge)
