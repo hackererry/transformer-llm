@@ -31,6 +31,15 @@ from .device import (
     DeviceManager,
     print_device_info,
 )
+from .profiling import (
+    OptimizationProfiler,
+    GQAMetrics,
+    StreamingMetrics,
+    SpeculativeMetrics,
+    FlashAttentionMetrics,
+    ModelOptimizationConfig,
+    format_memory_size,
+)
 
 __all__ = [
     # 日志
@@ -59,4 +68,12 @@ __all__ = [
     "get_optimal_num_threads",
     "DeviceManager",
     "print_device_info",
+    # 性能分析
+    "OptimizationProfiler",
+    "GQAMetrics",
+    "StreamingMetrics",
+    "SpeculativeMetrics",
+    "FlashAttentionMetrics",
+    "ModelOptimizationConfig",
+    "format_memory_size",
 ]

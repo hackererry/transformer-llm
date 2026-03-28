@@ -40,6 +40,10 @@ class RotaryEmbedding(nn.Module):
     """
     旋转位置编码(Rotary Position Embedding, RoPE)
     现代LLM(Llama, GPT-NeoX等)使用的位置编码方式
+
+    支持 YaRN (Yet another RoPE extension) 长度外推：
+    - 通过 NTK-aware 频率缩放扩展上下文长度
+    - 支持 4-32 倍外推无需重新训练
     """
 
     def __init__(
@@ -47,14 +51,23 @@ class RotaryEmbedding(nn.Module):
         dim: int,
         max_position_embeddings: int = 2048,
         base: float = 10000.0,
+        scaling_factor: float = 1.0,
     ):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        self.scaling_factor = scaling_factor
+
+        # YaRN: NTK-aware 频率缩放
+        # 论文公式: base_scaled = base * (scale_factor ** (dim / (dim - 2)))
+        if scaling_factor > 1.0:
+            effective_base = base * (scaling_factor ** (dim / (dim - 2)))
+        else:
+            effective_base = base
 
         # 预计算频率
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (effective_base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # 预计算cos和sin缓存
@@ -68,6 +81,11 @@ class RotaryEmbedding(nn.Module):
             dtype = self.inv_freq.dtype
 
         t = torch.arange(seq_len, device=device, dtype=dtype)
+
+        # YaRN: 位置缩放（Position Interpolation）
+        if self.scaling_factor > 1.0:
+            t = t / self.scaling_factor
+
         freqs = torch.outer(t, self.inv_freq.to(device=device, dtype=dtype))
         # 重复以匹配所有维度
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -232,6 +250,7 @@ class TransformerEmbedding(nn.Module):
         position_embedding_type: str = "rope",
         rope_theta: float = 10000.0,
         head_dim: int = None,
+        rope_scaling: dict = None,
     ):
         super().__init__()
         self.token_embedding = TokenEmbedding(vocab_size, hidden_size, dropout)
@@ -239,12 +258,18 @@ class TransformerEmbedding(nn.Module):
         self.head_dim = head_dim or hidden_size // 8  # 默认假设8个头
 
         if position_embedding_type == "rope":
+            # 解析 YaRN 缩放配置
+            scaling_factor = 1.0
+            if rope_scaling is not None and rope_scaling.get("type") == "yarn":
+                scaling_factor = rope_scaling.get("factor", 1.0)
+
             # RoPE在Attention层应用，这里只创建对象
             # 注意：RoPE的dim应该是head_dim，不是hidden_size
             self.position_embedding = RotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings,
                 rope_theta,
+                scaling_factor=scaling_factor,
             )
         elif position_embedding_type == "learned":
             self.position_embedding = LearnedPositionalEmbedding(

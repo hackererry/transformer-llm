@@ -1,20 +1,19 @@
 """
-注意力机制模块
-包含Multi-Head Attention和RoPE集成
+标准Attention实现
+CPU/GPU通用，兼容性好
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
-import math
 
-from .embedding import apply_rotary_pos_emb
-from .layers import RMSNorm
+from .base import AttentionBase, apply_rotary_emb_qk, create_causal_mask
 
 
-class Attention(nn.Module):
+class StandardAttention(AttentionBase):
     """
-    多头注意力机制
+    标准多头注意力机制
+    使用分离的QKV投影，兼容性好
     支持RoPE位置编码和KV缓存
     """
 
@@ -26,16 +25,18 @@ class Attention(nn.Module):
         attention_dropout: float = 0.1,
         hidden_dropout: float = 0.1,
         max_position_embeddings: int = 2048,
+        **kwargs,  # 接受额外参数以保持接口兼容
     ):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.head_dim = head_dim
-        self.attention_dropout = attention_dropout
-        self.hidden_dropout = hidden_dropout
-        self.max_position_embeddings = max_position_embeddings
+        super().__init__(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            head_dim=head_dim,
+            attention_dropout=attention_dropout,
+            hidden_dropout=hidden_dropout,
+            max_position_embeddings=max_position_embeddings,
+        )
 
-        # QKV投影
+        # 分离的QKV投影（兼容性好）
         self.q_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=False)
@@ -43,12 +44,14 @@ class Attention(nn.Module):
         # 输出投影
         self.o_proj = nn.Linear(num_attention_heads * head_dim, hidden_size, bias=False)
 
-        # Dropout
-        self.attn_dropout = nn.Dropout(attention_dropout)
-        self.resid_dropout = nn.Dropout(hidden_dropout)
+        # 初始化权重
+        self.apply(self._init_weights)
 
-        # 缩放因子
-        self.scale = 1.0 / math.sqrt(head_dim)
+    # 兼容性别名
+    @property
+    def num_heads(self) -> int:
+        """兼容性别名"""
+        return self.num_attention_heads
 
     def forward(
         self,
@@ -80,7 +83,7 @@ class Attention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # 重塑为多头形式
+        # 重塑为多头形式 [batch, num_heads, seq_len, head_dim]
         query_states = query_states.view(
             batch_size, seq_len, self.num_attention_heads, self.head_dim
         ).transpose(1, 2)
@@ -93,8 +96,8 @@ class Attention(nn.Module):
 
         # 应用RoPE
         if cos is not None and sin is not None:
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids
+            query_states, key_states = apply_rotary_emb_qk(
+                query_states, key_states, cos, sin
             )
 
         # 处理KV缓存
@@ -112,9 +115,19 @@ class Attention(nn.Module):
 
         # 应用注意力掩码
         if attention_mask is not None:
+            # 处理不同形状的attention_mask
+            if attention_mask.dim() == 2:
+                # [batch, seq_len] -> [batch, 1, 1, seq_len]
+                attention_mask = attention_mask[:, None, None, :]
+            elif attention_mask.dim() == 3:
+                # [batch, 1, seq_len] -> [batch, 1, 1, seq_len]
+                attention_mask = attention_mask.unsqueeze(1)
+
+            # 将padding位置的注意力设为负无穷
+            attention_mask = (1.0 - attention_mask.to(attn_weights.dtype)) * -1e9
             attn_weights = attn_weights + attention_mask
 
-        # Softmax和Dropout
+        # Softmax（使用FP32提高数值稳定性）
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
             query_states.dtype
         )
@@ -134,10 +147,11 @@ class Attention(nn.Module):
         return attn_output, present_key_value
 
 
-class FlashAttention(nn.Module):
+class ChunkedAttention(AttentionBase):
     """
-    Flash Attention的CPU实现
-    注意: 真正的Flash Attention需要CUDA，这里提供内存优化的替代实现
+    分块计算的Attention
+    用于减少内存峰值，适用于长序列
+    注意：这不是Flash Attention，只是分块计算
     """
 
     def __init__(
@@ -148,11 +162,15 @@ class FlashAttention(nn.Module):
         attention_dropout: float = 0.1,
         hidden_dropout: float = 0.1,
         chunk_size: int = 64,
+        **kwargs,
     ):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.head_dim = head_dim
+        super().__init__(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            head_dim=head_dim,
+            attention_dropout=attention_dropout,
+            hidden_dropout=hidden_dropout,
+        )
         self.chunk_size = chunk_size
 
         # QKV投影
@@ -163,11 +181,7 @@ class FlashAttention(nn.Module):
         # 输出投影
         self.o_proj = nn.Linear(num_attention_heads * head_dim, hidden_size, bias=False)
 
-        # Dropout
-        self.attn_dropout = nn.Dropout(attention_dropout)
-        self.resid_dropout = nn.Dropout(hidden_dropout)
-
-        self.scale = 1.0 / math.sqrt(head_dim)
+        self.apply(self._init_weights)
 
     def forward(
         self,
@@ -176,10 +190,9 @@ class FlashAttention(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        分块计算注意力以节省内存
-        """
+        **kwargs,
+    ) -> Tuple[torch.Tensor, None]:
+        """分块计算注意力以节省内存"""
         batch_size, seq_len, _ = hidden_states.shape
 
         # 计算QKV
@@ -194,7 +207,7 @@ class FlashAttention(nn.Module):
 
         # 应用RoPE
         if cos is not None and sin is not None:
-            query, key = apply_rotary_pos_emb(query, key, cos, sin, position_ids)
+            query, key = apply_rotary_emb_qk(query, key, cos, sin)
 
         # 分块计算注意力
         output = self._chunked_attention(query, key, value, attention_mask)
@@ -202,7 +215,7 @@ class FlashAttention(nn.Module):
         # 重塑和输出投影
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         output = self.o_proj(output)
-        return self.resid_dropout(output)
+        return self.resid_dropout(output), None
 
     def _chunked_attention(
         self,
@@ -245,101 +258,6 @@ class FlashAttention(nn.Module):
         return output
 
 
-class GroupedQueryAttention(nn.Module):
-    """
-    分组查询注意力(Grouped Query Attention, GQA)
-    多个query头共享一个key/value头
-    可减少KV缓存大小
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        head_dim: int,
-        attention_dropout: float = 0.1,
-        hidden_dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim
-        self.num_key_value_groups = num_attention_heads // num_key_value_heads
-
-        # Q投影
-        self.q_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=False)
-        # KV投影(使用较少的头)
-        self.k_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=False)
-
-        # 输出投影
-        self.o_proj = nn.Linear(num_attention_heads * head_dim, hidden_size, bias=False)
-
-        # Dropout
-        self.attn_dropout = nn.Dropout(attention_dropout)
-        self.resid_dropout = nn.Dropout(hidden_dropout)
-
-        self.scale = 1.0 / math.sqrt(head_dim)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        cos: Optional[torch.Tensor] = None,
-        sin: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.shape
-
-        # 计算QKV
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
-
-        # 重塑Q
-        query = query.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
-
-        # 重塑KV
-        key = key.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value = value.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        # 应用RoPE
-        if cos is not None and sin is not None:
-            query, key = apply_rotary_pos_emb(query, key, cos, sin, position_ids)
-
-        # 扩展KV以匹配Q的头数
-        key = self._repeat_kv(key)
-        value = self._repeat_kv(value)
-
-        # 计算注意力
-        attn_weights = torch.matmul(query, key.transpose(-2, -1)) * self.scale
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        output = torch.matmul(attn_weights, value)
-
-        # 重塑
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
-        output = self.o_proj(output)
-        return self.resid_dropout(output)
-
-    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
-        """重复KV头以匹配Q头数"""
-        if self.num_key_value_groups == 1:
-            return x
-        batch_size, num_heads, seq_len, head_dim = x.shape
-        x = x[:, :, None, :, :].expand(
-            batch_size, num_heads, self.num_key_value_groups, seq_len, head_dim
-        )
-        return x.reshape(batch_size, num_heads * self.num_key_value_groups, seq_len, head_dim)
-
-
 class CrossAttention(nn.Module):
     """
     交叉注意力
@@ -353,11 +271,13 @@ class CrossAttention(nn.Module):
         head_dim: int,
         attention_dropout: float = 0.1,
         hidden_dropout: float = 0.1,
+        **kwargs,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
+        self.scale = 1.0 / math.sqrt(head_dim)
 
         # Q投影(来自解码器)
         self.q_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=False)
@@ -372,15 +292,14 @@ class CrossAttention(nn.Module):
         self.attn_dropout = nn.Dropout(attention_dropout)
         self.resid_dropout = nn.Dropout(hidden_dropout)
 
-        self.scale = 1.0 / math.sqrt(head_dim)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        **kwargs,
+    ) -> Tuple[torch.Tensor, None]:
         """
         Args:
             hidden_states: 解码器隐藏状态 [batch, seq_len, hidden]
@@ -415,4 +334,8 @@ class CrossAttention(nn.Module):
         # 重塑
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         output = self.o_proj(output)
-        return self.resid_dropout(output)
+        return self.resid_dropout(output), None
+
+
+# 兼容性别名
+Attention = StandardAttention
