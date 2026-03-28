@@ -45,6 +45,23 @@ class ModelConfig:
     sink_size: int = 4                    # Attention Sink 数量（锚点）
     streaming_window_size: int = 4096     # 滑动窗口大小
 
+    # ============== MoE 配置（默认启用）==============
+    use_moe: bool = True                  # 是否启用 Mixture of Experts
+    num_experts: int = 8                  # 专家数量
+    num_shared_experts: int = 1           # 共享专家数量（始终激活）
+    num_experts_per_tok: int = 2          # 每个 token 激活的专家数 (top-k)
+    expert_intermediate_size: Optional[int] = None  # 专家 FFN 中间层维度，None 表示使用 intermediate_size
+    router_noise_std: float = 0.1         # 路由噪声标准差（训练时用于负载均衡）
+    routed_scaling_factor: float = 1.0    # 路由输出缩放因子
+    aux_loss_alpha: float = 0.01          # 负载均衡辅助损失系数
+
+    # ============== MLA 配置（默认启用）==============
+    use_mla: bool = True                  # 是否启用 Multi-Head Latent Attention
+    kv_lora_rank: int = 512               # KV 压缩维度
+    q_lora_rank: int = 1536               # Q 压缩维度
+    rope_head_dim: int = 64               # 应用 RoPE 的维度（解耦 RoPE）
+    v_head_dim: int = 128                 # V 的 head 维度
+
     def __post_init__(self):
         """配置验证和自动计算"""
         # 确保hidden_size能被num_attention_heads整除
@@ -67,6 +84,18 @@ class ModelConfig:
         assert self.num_attention_heads % self.num_key_value_heads == 0, \
             f"num_attention_heads ({self.num_attention_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})"
 
+        # MLA 配置验证和自动调整
+        if self.use_mla:
+            # rope_head_dim 不能超过 head_dim
+            if self.rope_head_dim > self.head_dim:
+                self.rope_head_dim = self.head_dim
+            # q_lora_rank 不能超过 hidden_size
+            if self.q_lora_rank > self.hidden_size:
+                self.q_lora_rank = self.hidden_size
+            # v_head_dim 不能超过 head_dim
+            if self.v_head_dim > self.head_dim:
+                self.v_head_dim = self.head_dim
+
     @property
     def use_gqa(self) -> bool:
         """是否使用GQA"""
@@ -74,7 +103,7 @@ class ModelConfig:
 
     @classmethod
     def tiny(cls) -> "ModelConfig":
-        """Tiny配置: ~10M参数"""
+        """Tiny配置: ~10M参数，小模型建议用密集型FFN"""
         return cls(
             vocab_size=32000,
             hidden_size=256,
@@ -82,11 +111,13 @@ class ModelConfig:
             num_attention_heads=8,
             intermediate_size=512,
             max_position_embeddings=1024,
+            use_moe=False,  # 小模型禁用 MoE
+            use_mla=True,   # MLA 几乎零开销
         )
 
     @classmethod
     def small(cls) -> "ModelConfig":
-        """Small配置: ~100M参数"""
+        """Small配置: ~100M参数，可选 MoE"""
         return cls(
             vocab_size=32000,
             hidden_size=512,
@@ -94,11 +125,13 @@ class ModelConfig:
             num_attention_heads=8,
             intermediate_size=1024,
             max_position_embeddings=2048,
+            use_moe=False,  # 100M 模型可用 FFN
+            use_mla=True,
         )
 
     @classmethod
     def medium(cls) -> "ModelConfig":
-        """Medium配置: ~500M参数"""
+        """Medium配置: ~500M参数，可启用 MoE"""
         return cls(
             vocab_size=32000,
             hidden_size=1024,
@@ -106,6 +139,42 @@ class ModelConfig:
             num_attention_heads=16,
             intermediate_size=2048,
             max_position_embeddings=4096,
+            use_moe=True,   # 500M+ 建议启用 MoE
+            num_experts=8,
+            num_experts_per_tok=2,
+            use_mla=True,
+        )
+
+    @classmethod
+    def moe_small(cls) -> "ModelConfig":
+        """MoE小配置: ~100M参数，MoE版本"""
+        return cls(
+            vocab_size=32000,
+            hidden_size=512,
+            num_hidden_layers=12,
+            num_attention_heads=8,
+            intermediate_size=1024,
+            max_position_embeddings=2048,
+            use_moe=True,
+            num_experts=8,
+            num_experts_per_tok=2,
+            use_mla=True,
+        )
+
+    @classmethod
+    def moe_medium(cls) -> "ModelConfig":
+        """MoE中配置: ~500M参数，MoE版本"""
+        return cls(
+            vocab_size=32000,
+            hidden_size=1024,
+            num_hidden_layers=24,
+            num_attention_heads=16,
+            intermediate_size=2048,
+            max_position_embeddings=4096,
+            use_moe=True,
+            num_experts=16,
+            num_experts_per_tok=4,
+            use_mla=True,
         )
 
     def to_dict(self) -> dict:
@@ -131,6 +200,21 @@ class ModelConfig:
             "use_streaming_llm": self.use_streaming_llm,
             "sink_size": self.sink_size,
             "streaming_window_size": self.streaming_window_size,
+            # MoE 配置
+            "use_moe": self.use_moe,
+            "num_experts": self.num_experts,
+            "num_shared_experts": self.num_shared_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
+            "expert_intermediate_size": self.expert_intermediate_size,
+            "router_noise_std": self.router_noise_std,
+            "routed_scaling_factor": self.routed_scaling_factor,
+            "aux_loss_alpha": self.aux_loss_alpha,
+            # MLA 配置
+            "use_mla": self.use_mla,
+            "kv_lora_rank": self.kv_lora_rank,
+            "q_lora_rank": self.q_lora_rank,
+            "rope_head_dim": self.rope_head_dim,
+            "v_head_dim": self.v_head_dim,
         }
 
     @classmethod

@@ -487,7 +487,7 @@ class TestTransformerBlock:
         batch_size, seq_len = 2, 16
         hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
 
-        output, _ = block(hidden_states)
+        output, _, _ = block(hidden_states)
         assert output.shape == hidden_states.shape
 
     def test_block_with_position_ids(self):
@@ -499,7 +499,7 @@ class TestTransformerBlock:
         hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
         position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
 
-        output, _ = block(hidden_states, position_ids=position_ids)
+        output, _, _ = block(hidden_states, position_ids=position_ids)
         assert output.shape == hidden_states.shape
 
 
@@ -520,7 +520,7 @@ class TestTransformerModel:
         batch_size, seq_len = 2, 16
         input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
 
-        hidden_states, _ = model(input_ids)
+        hidden_states, _, _ = model(input_ids)
         assert hidden_states.shape == (batch_size, seq_len, config.hidden_size)
 
     def test_get_set_input_embeddings(self):

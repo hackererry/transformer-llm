@@ -10,42 +10,86 @@ import math
 
 from .config import ModelConfig
 from .layers import RMSNorm, SwiGLUFFN
-from .attention import create_attention
+from .attention import create_attention, MultiHeadLatentAttention, MLAKVCache
 from .embedding import TransformerEmbedding
+
+# MoE 支持
+from .moe import DeepSeekMoE
 
 
 class TransformerBlock(nn.Module):
     """
     单个Transformer块
-    包含Self-Attention和FFN，使用Pre-Norm架构
+    包含Self-Attention和FFN/MoE，使用Pre-Norm架构
+
+    支持特性:
+    - 标准 Attention 或 MLA (Multi-Head Latent Attention)
+    - 标准 FFN 或 MoE (Mixture of Experts)
     """
 
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        self.config = config
 
-        # 注意力层（使用统一工厂函数）
-        self.self_attn = create_attention(
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            head_dim=config.head_dim,
-            num_key_value_heads=config.num_key_value_heads,
-            attention_dropout=config.attention_dropout,
-            hidden_dropout=config.hidden_dropout,
-            max_position_embeddings=config.max_position_embeddings,
-            use_flash=config.use_flash_attention,
-            use_gqa=config.use_gqa,
-            use_streaming_llm=config.use_streaming_llm,
-            sink_size=config.sink_size,
-            streaming_window_size=config.streaming_window_size,
-        )
+        # MoE 辅助损失系数
+        self.aux_loss_alpha = config.aux_loss_alpha if config.use_moe else 0.0
 
-        # FFN层
-        self.mlp = SwiGLUFFN(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_dropout=config.hidden_dropout,
-        )
+        # 注意力层选择
+        if config.use_mla:
+            # 使用 MLA (Multi-Head Latent Attention)
+            self.self_attn = MultiHeadLatentAttention(
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                head_dim=config.head_dim,
+                kv_lora_rank=config.kv_lora_rank,
+                q_lora_rank=config.q_lora_rank,
+                rope_head_dim=config.rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                attention_dropout=config.attention_dropout,
+                hidden_dropout=config.hidden_dropout,
+                max_position_embeddings=config.max_position_embeddings,
+                use_flash_attn=config.use_flash_attention,
+            )
+        else:
+            # 使用标准 Attention（通过统一工厂函数）
+            self.self_attn = create_attention(
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                head_dim=config.head_dim,
+                num_key_value_heads=config.num_key_value_heads,
+                attention_dropout=config.attention_dropout,
+                hidden_dropout=config.hidden_dropout,
+                max_position_embeddings=config.max_position_embeddings,
+                use_flash=config.use_flash_attention,
+                use_gqa=config.use_gqa,
+                use_streaming_llm=config.use_streaming_llm,
+                sink_size=config.sink_size,
+                streaming_window_size=config.streaming_window_size,
+            )
+
+        # FFN/MoE 层选择
+        if config.use_moe:
+            # 使用 MoE (Mixture of Experts)
+            expert_intermediate_size = config.expert_intermediate_size or config.intermediate_size
+            self.mlp = DeepSeekMoE(
+                hidden_size=config.hidden_size,
+                intermediate_size=expert_intermediate_size,
+                num_experts=config.num_experts,
+                num_shared_experts=config.num_shared_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_dropout=config.hidden_dropout,
+                router_noise_std=config.router_noise_std,
+                routed_scaling_factor=config.routed_scaling_factor,
+                aux_loss_alpha=config.aux_loss_alpha,
+            )
+        else:
+            # 使用标准 FFN
+            self.mlp = SwiGLUFFN(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_dropout=config.hidden_dropout,
+            )
 
         # Layer Norm (Pre-Norm架构)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -60,7 +104,7 @@ class TransformerBlock(nn.Module):
         sin: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
         """
         Args:
             hidden_states: 输入张量 [batch_size, seq_len, hidden_size]
@@ -69,6 +113,11 @@ class TransformerBlock(nn.Module):
             cos, sin: RoPE位置编码
             past_key_value: KV缓存
             use_cache: 是否使用缓存
+
+        Returns:
+            hidden_states: 输出张量
+            present_key_value: KV缓存
+            aux_loss: MoE 辅助损失（如果使用 MoE）
         """
         residual = hidden_states
 
@@ -85,13 +134,21 @@ class TransformerBlock(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # Pre-Norm + FFN
+        # Pre-Norm + FFN/MoE
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+
+        # MoE 返回 (output, aux_outputs) 元组
+        aux_loss = None
+        if self.config.use_moe:
+            hidden_states, aux_outputs = self.mlp(hidden_states)
+            aux_loss = aux_outputs.get("aux_loss") if aux_outputs else None
+        else:
+            hidden_states = self.mlp(hidden_states)
+
         hidden_states = residual + hidden_states
 
-        return hidden_states, present_key_value
+        return hidden_states, present_key_value, aux_loss
 
 
 class TransformerModel(nn.Module):
@@ -142,7 +199,7 @@ class TransformerModel(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]], torch.Tensor]:
         """
         Args:
             input_ids: 输入token ID [batch_size, seq_len]
@@ -152,7 +209,8 @@ class TransformerModel(nn.Module):
             use_cache: 是否使用KV缓存
         Returns:
             hidden_states: 最后一层隐藏状态 [batch_size, seq_len, hidden_size]
-            present_key_values: 当前的KV缓存列表
+            present_key_values: 当前的KV缓存列表（如果 use_cache=True）
+            aux_loss: MoE 辅助损失（如果不使用 MoE 则为 0）
         """
         batch_size, seq_len = input_ids.shape
 
@@ -175,11 +233,14 @@ class TransformerModel(nn.Module):
 
         present_key_values = []
 
+        # MoE 辅助损失累加
+        total_aux_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+
         # 逐层计算
         for idx, layer in enumerate(self.layers):
             past_kv = past_key_values[idx] if past_key_values else None
 
-            hidden_states, present_kv = layer(
+            hidden_states, present_kv, aux_loss = layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -189,13 +250,17 @@ class TransformerModel(nn.Module):
                 use_cache=use_cache,
             )
 
+            # 累加 MoE 辅助损失
+            if aux_loss is not None:
+                total_aux_loss = total_aux_loss + aux_loss
+
             if use_cache:
                 present_key_values.append(present_kv)
 
         # 最终LayerNorm
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, present_key_values if use_cache else None
+        return hidden_states, present_key_values if use_cache else None, total_aux_loss
 
     def _prepare_attention_mask(
         self,
@@ -329,10 +394,11 @@ class CausalLMModel(nn.Module):
             dict包含:
                 - logits: 输出logits [batch_size, seq_len, vocab_size]
                 - loss: 交叉熵损失(如果提供了labels)
+                - aux_loss: MoE 辅助损失(如果使用 MoE)
                 - past_key_values: KV缓存(如果use_cache=True)
         """
         # Transformer前向传播
-        hidden_states, past_key_values = self.model(
+        hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -353,7 +419,14 @@ class CausalLMModel(nn.Module):
         # 计算损失
         if labels is not None:
             loss = self._compute_loss(logits, labels)
+            # 如果使用 MoE，将辅助损失加到总损失中
+            if self.config.use_moe and aux_loss is not None:
+                loss = loss + self.config.aux_loss_alpha * aux_loss
             output["loss"] = loss
+
+        # MoE 辅助损失（用于监控）
+        if self.config.use_moe and aux_loss is not None:
+            output["aux_loss"] = aux_loss
 
         if use_cache:
             output["past_key_values"] = past_key_values
