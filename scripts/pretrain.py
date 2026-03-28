@@ -19,7 +19,7 @@ from src.data import (
     ShardedPreprocessedDataset,
 )
 from src.training import Trainer, TrainingConfig, save_pretrained
-from src.utils import set_seed, print_device_info, get_memory_info
+from src.utils import set_seed, print_device_info, get_memory_info, OptimizationProfiler
 
 
 def parse_args():
@@ -57,9 +57,15 @@ def parse_args():
     parser.add_argument("--fp16", action="store_true", default=None,
                         help="使用FP16精度")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="启用梯度检查点")
-    parser.add_argument("--use_flash_attention", action="store_true", default=False,
-                        help="使用Flash Attention(GPU)")
     parser.add_argument("--num_workers", type=int, default=0, help="数据加载进程数")
+
+    # 模型优化参数（覆盖 ModelConfig 默认值）
+    parser.add_argument("--no_flash_attention", action="store_true",
+                        help="禁用Flash Attention（默认启用）")
+    parser.add_argument("--no_gqa", action="store_true",
+                        help="禁用GQA分组查询注意力（默认启用）")
+    parser.add_argument("--rope_scaling_factor", type=float, default=4.0,
+                        help="YaRN长度外推因子（默认4.0，支持4倍外推）")
 
     # 日志和保存
     parser.add_argument("--logging_dir", type=str, default="./logs", help="日志目录")
@@ -217,7 +223,66 @@ def main():
     config.max_position_embeddings = max(config.max_position_embeddings, max_seq_length)
     config.gradient_checkpointing = args.gradient_checkpointing
 
+    # 应用模型优化参数（覆盖默认值）
+    if args.no_flash_attention:
+        config.use_flash_attention = False
+    if args.no_gqa:
+        config.num_key_value_heads = config.num_attention_heads  # 禁用GQA
+    if args.rope_scaling_factor != 4.0:
+        config.rope_scaling = {"type": "yarn", "factor": args.rope_scaling_factor}
+
     print(f"Model config: {config.to_dict()}")
+
+    # 创建优化项性能分析器
+    profiler = OptimizationProfiler()
+
+    # 判断是否使用 GQA
+    use_gqa = config.num_key_value_heads != config.num_attention_heads
+
+    # 判断是否使用 YaRN
+    use_yarn = config.rope_scaling is not None and config.rope_scaling.get("type") == "yarn"
+    yarn_factor = config.rope_scaling.get("factor", 1.0) if use_yarn else 1.0
+
+    # 判断混合精度
+    if args.bf16:
+        mixed_precision = "bf16"
+    elif args.fp16:
+        mixed_precision = "fp16"
+    else:
+        mixed_precision = "fp32"
+
+    # 记录优化配置
+    profiler.record_optimization_config(
+        use_gqa=use_gqa,
+        use_flash_attention=config.use_flash_attention,
+        use_yarn=use_yarn,
+        yarn_factor=yarn_factor,
+        use_streaming_llm=config.use_streaming_llm,
+        use_speculative_decoding=False,  # 训练时不使用
+        gradient_checkpointing=args.gradient_checkpointing,
+        mixed_precision=mixed_precision,
+    )
+
+    # 记录 GQA 指标
+    profiler.record_gqa_metrics(
+        num_heads=config.num_attention_heads,
+        num_kv_heads=config.num_key_value_heads,
+        seq_len=max_seq_length,
+        batch_size=args.per_device_train_batch_size,
+        head_dim=config.head_dim,
+        num_layers=config.num_hidden_layers,
+    )
+
+    # 记录 Flash Attention 理论估算（如果启用）
+    if config.use_flash_attention:
+        profiler.record_flash_attention_metrics(
+            seq_len=max_seq_length,
+            batch_size=args.per_device_train_batch_size,
+            num_heads=config.num_attention_heads,
+            head_dim=config.head_dim,
+            num_layers=config.num_hidden_layers,
+            dtype_size=2 if args.bf16 or args.fp16 else 4,
+        )
 
     # 加载或创建模型
     model, config = load_or_create_model(args, config)
@@ -256,7 +321,6 @@ def main():
         bf16=args.bf16 or False,
         fp16=args.fp16 or False,
         gradient_checkpointing=args.gradient_checkpointing,
-        use_flash_attention=args.use_flash_attention,
         dataloader_num_workers=args.num_workers,
         logging_dir=args.logging_dir,
         logging_steps=args.logging_steps,
@@ -284,6 +348,17 @@ def main():
     print(f"Global step: {results['global_step']}")
     if 'training_time' in results:
         print(f"Training time: {results['training_time']/3600:.2f} hours")
+
+    # 打印优化项性能报告
+    profiler.print_report()
+
+    # 保存性能报告到文件
+    profiler.save_report(
+        output_dir="logs/perf",
+        prefix="pretrain",
+        training_results=results,
+        model_config=config.to_dict(),
+    )
 
     # 保存最终模型
     final_model_path = os.path.join(args.output_dir, "final_model")

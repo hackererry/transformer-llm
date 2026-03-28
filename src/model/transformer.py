@@ -10,7 +10,7 @@ import math
 
 from .config import ModelConfig
 from .layers import RMSNorm, SwiGLUFFN
-from .attention import Attention
+from .attention import create_attention
 from .embedding import TransformerEmbedding
 
 
@@ -24,14 +24,20 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
 
-        # 注意力层
-        self.self_attn = Attention(
+        # 注意力层（使用统一工厂函数）
+        self.self_attn = create_attention(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             head_dim=config.head_dim,
+            num_key_value_heads=config.num_key_value_heads,
             attention_dropout=config.attention_dropout,
             hidden_dropout=config.hidden_dropout,
             max_position_embeddings=config.max_position_embeddings,
+            use_flash=config.use_flash_attention,
+            use_gqa=config.use_gqa,
+            use_streaming_llm=config.use_streaming_llm,
+            sink_size=config.sink_size,
+            streaming_window_size=config.streaming_window_size,
         )
 
         # FFN层
@@ -106,6 +112,7 @@ class TransformerModel(nn.Module):
             dropout=config.hidden_dropout,
             position_embedding_type="rope",
             rope_theta=config.rope_theta,
+            rope_scaling=config.rope_scaling,
         )
 
         # Transformer层
@@ -455,6 +462,90 @@ class CausalLMModel(nn.Module):
             input_ids = torch.cat([input_ids, next_token], dim=-1)
 
             # 检查EOS
+            if eos_token_id is not None and next_token.item() == eos_token_id:
+                break
+
+        return input_ids
+
+    @torch.no_grad()
+    def generate_streaming(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 1000,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        do_sample: bool = True,
+        eos_token_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        StreamingLLM 生成方法
+        支持无限长度推理，固定显存占用
+
+        使用滑动窗口 + Attention Sink 技术，可以生成任意长度的文本
+        而不会随着序列增长而增加显存占用
+
+        注意：需要设置 config.use_streaming_llm=True 才能启用 StreamingLLM
+        """
+        self.eval()
+
+        # 如果未启用 StreamingLLM，使用标准 generate
+        if not self.config.use_streaming_llm:
+            return self.generate(
+                input_ids, max_new_tokens, temperature, top_k, top_p, do_sample, None, eos_token_id
+            )
+
+        # 初始化 KV 缓存
+        past_key_values = None
+
+        for step in range(max_new_tokens):
+            # 第一步处理整个 prompt，之后只处理最后一个 token
+            if step == 0:
+                step_input = input_ids
+            else:
+                step_input = input_ids[:, -1:]
+
+            # 前向传播（使用 KV 缓存）
+            outputs = self(
+                input_ids=step_input,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+
+            # 更新 KV 缓存
+            past_key_values = outputs.get("past_key_values")
+
+            # 获取 logits
+            logits = outputs["logits"][:, -1, :]
+
+            # 温度缩放
+            if temperature != 1.0:
+                logits = logits / temperature
+
+            # 采样
+            if do_sample:
+                if top_k > 0:
+                    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                    logits[indices_to_remove] = float("-inf")
+
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = float("-inf")
+
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            # 拼接
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+
+            # 检查 EOS
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
 

@@ -14,6 +14,11 @@ from .attention import (
     FlashAttention,
     GroupedQueryAttention,
     CrossAttention,
+    is_flash_attention_available,
+    is_sdpa_available,
+    get_attention_info,
+    create_attention,
+    get_attention_class,
 )
 from .embedding import (
     TokenEmbedding,
@@ -39,18 +44,6 @@ from .lm_head import (
     SequenceSummary,
 )
 
-# GPU优化的注意力（可选导入）
-try:
-    from .attention_gpu import (
-        FlashAttention as GPUFlashAttention,
-        ScaledDotProductAttention,
-        get_attention_class,
-        is_flash_attention_available,
-    )
-    _gpu_attention_available = True
-except ImportError:
-    _gpu_attention_available = False
-
 __all__ = [
     # 配置
     "ModelConfig",
@@ -66,6 +59,11 @@ __all__ = [
     "FlashAttention",
     "GroupedQueryAttention",
     "CrossAttention",
+    "is_flash_attention_available",
+    "is_sdpa_available",
+    "get_attention_info",
+    "create_attention",
+    "get_attention_class",
     # 嵌入
     "TokenEmbedding",
     "RotaryEmbedding",
@@ -87,12 +85,3 @@ __all__ = [
     "Pooler",
     "SequenceSummary",
 ]
-
-# GPU优化（可选）
-if _gpu_attention_available:
-    __all__.extend([
-        "GPUFlashAttention",
-        "ScaledDotProductAttention",
-        "get_attention_class",
-        "is_flash_attention_available",
-    ])

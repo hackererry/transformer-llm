@@ -230,8 +230,7 @@ class TestRotaryEmbedding:
         """测试位置ID"""
         rope = RotaryEmbedding(dim=64, max_position_embeddings=512)
         x = torch.randn(2, 10, 64)
-        position_ids = torch.arange(10).unsqueeze(0)
-        cos, sin = rope(x, seq_len=10, position_ids=position_ids)
+        cos, sin = rope(x, seq_len=10)
         assert cos.shape == (10, 64)
 
 
@@ -558,13 +557,13 @@ class TestLMHead:
 
     def test_lm_head_creation(self):
         """测试LMHead创建"""
-        head = LMHead(vocab_size=1000, hidden_size=256)
-        assert head.out_features == 1000
-        assert head.in_features == 256
+        head = LMHead(hidden_size=256, vocab_size=1000)
+        assert head.vocab_size == 1000
+        assert head.hidden_size == 256
 
     def test_lm_head_forward(self):
         """测试LMHead前向传播"""
-        head = LMHead(vocab_size=1000, hidden_size=256)
+        head = LMHead(hidden_size=256, vocab_size=1000)
         hidden_states = torch.randn(2, 10, 256)
         logits = head(hidden_states)
         assert logits.shape == (2, 10, 1000)

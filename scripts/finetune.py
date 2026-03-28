@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.model import ModelConfig, CausalLMModel
 from src.data import FinetuneDataset, get_collator, get_tokenizer
 from src.training import Trainer, TrainingConfig, save_pretrained, load_model
-from src.utils import setup_logger, set_seed, print_device_info
+from src.utils import setup_logger, set_seed, print_device_info, OptimizationProfiler
 
 
 def parse_args():
@@ -57,6 +57,14 @@ def parse_args():
     parser.add_argument("--gradient_checkpointing", action="store_true", help="启用梯度检查点")
     parser.add_argument("--num_workers", type=int, default=0, help="数据加载器工作进程数")
 
+    # 模型优化参数（覆盖 ModelConfig 默认值）
+    parser.add_argument("--no_flash_attention", action="store_true",
+                        help="禁用Flash Attention（默认启用）")
+    parser.add_argument("--no_gqa", action="store_true",
+                        help="禁用GQA分组查询注意力（默认启用）")
+    parser.add_argument("--rope_scaling_factor", type=float, default=4.0,
+                        help="YaRN长度外推因子（默认4.0，支持4倍外推）")
+
     # 其他
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="恢复训练的检查点路径")
@@ -97,6 +105,15 @@ def main():
         else:
             config = ModelConfig.tiny()
 
+        # 应用模型优化参数（覆盖配置）
+        config.gradient_checkpointing = args.gradient_checkpointing
+        if args.no_flash_attention:
+            config.use_flash_attention = False
+        if args.no_gqa:
+            config.num_key_value_heads = config.num_attention_heads  # 禁用GQA
+        if args.rope_scaling_factor != 4.0:
+            config.rope_scaling = {"type": "yarn", "factor": args.rope_scaling_factor}
+
         model = CausalLMModel(config)
         # 优先尝试加载 internal format (.pt)
         pt_path = os.path.join(args.model_path, "final_model.pt")
@@ -118,9 +135,67 @@ def main():
         else:
             config = ModelConfig.medium()
 
+        # 应用模型优化参数（覆盖默认值）
+        config.gradient_checkpointing = args.gradient_checkpointing
+        if args.no_flash_attention:
+            config.use_flash_attention = False
+        if args.no_gqa:
+            config.num_key_value_heads = config.num_attention_heads  # 禁用GQA
+        if args.rope_scaling_factor != 4.0:
+            config.rope_scaling = {"type": "yarn", "factor": args.rope_scaling_factor}
+
         model = CausalLMModel(config)
 
     logger.info(f"Model config: {config.to_dict()}")
+
+    # 创建优化项性能分析器
+    profiler = OptimizationProfiler()
+
+    # 判断是否使用 GQA
+    use_gqa = config.num_key_value_heads != config.num_attention_heads
+
+    # 判断是否使用 YaRN
+    use_yarn = config.rope_scaling is not None and config.rope_scaling.get("type") == "yarn"
+    yarn_factor = config.rope_scaling.get("factor", 1.0) if use_yarn else 1.0
+
+    # 判断混合精度
+    if args.bf16:
+        mixed_precision = "bf16"
+    else:
+        mixed_precision = "fp32"
+
+    # 记录优化配置
+    profiler.record_optimization_config(
+        use_gqa=use_gqa,
+        use_flash_attention=config.use_flash_attention,
+        use_yarn=use_yarn,
+        yarn_factor=yarn_factor,
+        use_streaming_llm=config.use_streaming_llm,
+        use_speculative_decoding=False,  # 训练时不使用
+        gradient_checkpointing=args.gradient_checkpointing,
+        mixed_precision=mixed_precision,
+    )
+
+    # 记录 GQA 指标
+    profiler.record_gqa_metrics(
+        num_heads=config.num_attention_heads,
+        num_kv_heads=config.num_key_value_heads,
+        seq_len=args.max_seq_length,
+        batch_size=args.per_device_train_batch_size,
+        head_dim=config.head_dim,
+        num_layers=config.num_hidden_layers,
+    )
+
+    # 记录 Flash Attention 理论估算（如果启用）
+    if config.use_flash_attention:
+        profiler.record_flash_attention_metrics(
+            seq_len=args.max_seq_length,
+            batch_size=args.per_device_train_batch_size,
+            num_heads=config.num_attention_heads,
+            head_dim=config.head_dim,
+            num_layers=config.num_hidden_layers,
+            dtype_size=2 if args.bf16 else 4,
+        )
 
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
@@ -207,6 +282,17 @@ def main():
     results = trainer.train()
 
     logger.info(f"Training completed. Results: {results}")
+
+    # 打印优化项性能报告
+    profiler.print_report()
+
+    # 保存性能报告到文件
+    profiler.save_report(
+        output_dir="logs/perf",
+        prefix="finetune",
+        training_results=results,
+        model_config=config.to_dict(),
+    )
 
     # 保存最终模型
     final_model_path = os.path.join(args.output_dir, "final_model")

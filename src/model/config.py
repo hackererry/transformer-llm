@@ -17,9 +17,14 @@ class ModelConfig:
     num_attention_heads: int = 8  # 注意力头数
     intermediate_size: int = 1024  # FFN中间层维度
 
+    # GQA配置（Grouped Query Attention）
+    num_key_value_heads: Optional[int] = None  # KV头数，None表示与num_attention_heads相同
+    use_flash_attention: bool = True  # 是否使用Flash Attention
+
     # RoPE位置编码配置
     max_position_embeddings: int = 2048  # 最大序列长度
     rope_theta: float = 10000.0  # RoPE基数
+    rope_scaling: dict = field(default_factory=lambda: {"type": "yarn", "factor": 4.0})  # YaRN默认启用，4倍外推
 
     # 归一化配置
     rms_norm_eps: float = 1e-6  # RMSNorm epsilon
@@ -35,6 +40,11 @@ class ModelConfig:
     # 梯度检查点
     gradient_checkpointing: bool = False  # 是否启用梯度检查点
 
+    # StreamingLLM 配置（无限长度推理）
+    use_streaming_llm: bool = False       # 是否启用 StreamingLLM
+    sink_size: int = 4                    # Attention Sink 数量（锚点）
+    streaming_window_size: int = 4096     # 滑动窗口大小
+
     def __post_init__(self):
         """配置验证和自动计算"""
         # 确保hidden_size能被num_attention_heads整除
@@ -47,6 +57,20 @@ class ModelConfig:
         # 如果intermediate_size未指定，默认为4倍hidden_size
         if self.intermediate_size is None:
             self.intermediate_size = 4 * self.hidden_size
+
+        # 处理GQA配置
+        if self.num_key_value_heads is None:
+            # 默认使用 GQA，KV 头数为 Q 头数的 1/4（减少 75% KV 缓存）
+            self.num_key_value_heads = max(1, self.num_attention_heads // 4)
+
+        # 验证num_attention_heads能被num_key_value_heads整除
+        assert self.num_attention_heads % self.num_key_value_heads == 0, \
+            f"num_attention_heads ({self.num_attention_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})"
+
+    @property
+    def use_gqa(self) -> bool:
+        """是否使用GQA"""
+        return self.num_key_value_heads != self.num_attention_heads
 
     @classmethod
     def tiny(cls) -> "ModelConfig":
@@ -91,9 +115,12 @@ class ModelConfig:
             "hidden_size": self.hidden_size,
             "num_hidden_layers": self.num_hidden_layers,
             "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
             "intermediate_size": self.intermediate_size,
+            "use_flash_attention": self.use_flash_attention,
             "max_position_embeddings": self.max_position_embeddings,
             "rope_theta": self.rope_theta,
+            "rope_scaling": self.rope_scaling,
             "rms_norm_eps": self.rms_norm_eps,
             "hidden_dropout": self.hidden_dropout,
             "attention_dropout": self.attention_dropout,
@@ -101,14 +128,23 @@ class ModelConfig:
             "tie_word_embeddings": self.tie_word_embeddings,
             "gradient_checkpointing": self.gradient_checkpointing,
             "head_dim": self.head_dim,
+            "use_streaming_llm": self.use_streaming_llm,
+            "sink_size": self.sink_size,
+            "streaming_window_size": self.streaming_window_size,
         }
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "ModelConfig":
         """从字典创建配置"""
         # 移除计算得到的字段
-        config_dict = {k: v for k, v in config_dict.items() if k != "head_dim"}
+        config_dict = {k: v for k, v in config_dict.items() if k not in ["head_dim", "use_gqa"]}
         return cls(**config_dict)
+
+    def get_rope_scaling_factor(self) -> float:
+        """获取 RoPE 缩放因子"""
+        if self.rope_scaling is not None and self.rope_scaling.get("type") == "yarn":
+            return self.rope_scaling.get("factor", 1.0)
+        return 1.0
 
 
 @dataclass
