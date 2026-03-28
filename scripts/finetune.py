@@ -29,7 +29,7 @@ def parse_args():
 
     # 模型参数
     parser.add_argument("--model_path", type=str, default=None, help="预训练模型路径")
-    parser.add_argument("--model_config", type=str, default="tiny", choices=["tiny", "small", "medium"],
+    parser.add_argument("--model_config", type=str, default="small", choices=["tiny", "small", "medium", "moe_small", "moe_medium"],
                         help="模型配置(如果model_path为None)")
 
     # 训练参数
@@ -64,6 +64,24 @@ def parse_args():
                         help="禁用GQA分组查询注意力（默认启用）")
     parser.add_argument("--rope_scaling_factor", type=float, default=4.0,
                         help="YaRN长度外推因子（默认4.0，支持4倍外推）")
+
+    # MoE 配置参数（默认启用）
+    parser.add_argument("--no_moe", action="store_true",
+                        help="禁用 MoE，使用标准 FFN（默认启用 MoE）")
+    parser.add_argument("--num_experts", type=int, default=8,
+                        help="专家数量（默认8）")
+    parser.add_argument("--num_experts_per_tok", type=int, default=2,
+                        help="每个 token 激活的专家数（默认2）")
+    parser.add_argument("--aux_loss_alpha", type=float, default=0.01,
+                        help="MoE 负载均衡损失系数（默认0.01）")
+
+    # MLA 配置参数（默认启用）
+    parser.add_argument("--no_mla", action="store_true",
+                        help="禁用 MLA，使用标准 Attention（默认启用 MLA）")
+    parser.add_argument("--kv_lora_rank", type=int, default=512,
+                        help="MLA KV 压缩维度（默认512）")
+    parser.add_argument("--q_lora_rank", type=int, default=1536,
+                        help="MLA Q 压缩维度（默认1536）")
 
     # 其他
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -114,6 +132,23 @@ def main():
         if args.rope_scaling_factor != 4.0:
             config.rope_scaling = {"type": "yarn", "factor": args.rope_scaling_factor}
 
+        # 应用 MoE 配置
+        if args.no_moe:
+            config.use_moe = False
+        else:
+            config.use_moe = True
+            config.num_experts = args.num_experts
+            config.num_experts_per_tok = args.num_experts_per_tok
+            config.aux_loss_alpha = args.aux_loss_alpha
+
+        # 应用 MLA 配置
+        if args.no_mla:
+            config.use_mla = False
+        else:
+            config.use_mla = True
+            config.kv_lora_rank = args.kv_lora_rank
+            config.q_lora_rank = args.q_lora_rank
+
         model = CausalLMModel(config)
         # 优先尝试加载 internal format (.pt)
         pt_path = os.path.join(args.model_path, "final_model.pt")
@@ -132,8 +167,14 @@ def main():
             config = ModelConfig.tiny()
         elif args.model_config == "small":
             config = ModelConfig.small()
-        else:
+        elif args.model_config == "medium":
             config = ModelConfig.medium()
+        elif args.model_config == "moe_small":
+            config = ModelConfig.moe_small()
+        elif args.model_config == "moe_medium":
+            config = ModelConfig.moe_medium()
+        else:
+            config = ModelConfig.small()
 
         # 应用模型优化参数（覆盖默认值）
         config.gradient_checkpointing = args.gradient_checkpointing
@@ -143,6 +184,23 @@ def main():
             config.num_key_value_heads = config.num_attention_heads  # 禁用GQA
         if args.rope_scaling_factor != 4.0:
             config.rope_scaling = {"type": "yarn", "factor": args.rope_scaling_factor}
+
+        # 应用 MoE 配置
+        if args.no_moe:
+            config.use_moe = False
+        else:
+            config.use_moe = True
+            config.num_experts = args.num_experts
+            config.num_experts_per_tok = args.num_experts_per_tok
+            config.aux_loss_alpha = args.aux_loss_alpha
+
+        # 应用 MLA 配置
+        if args.no_mla:
+            config.use_mla = False
+        else:
+            config.use_mla = True
+            config.kv_lora_rank = args.kv_lora_rank
+            config.q_lora_rank = args.q_lora_rank
 
         model = CausalLMModel(config)
 

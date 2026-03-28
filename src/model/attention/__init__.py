@@ -39,6 +39,11 @@ from .streaming import (
     StreamingKVCache,
 )
 
+from .mla import (
+    MultiHeadLatentAttention,
+    MLAKVCache,
+)
+
 
 def create_attention(
     hidden_size: int,
@@ -52,6 +57,13 @@ def create_attention(
     use_gqa: bool = False,
     use_chunked: bool = False,
     use_streaming_llm: bool = False,
+    use_mla: bool = False,
+    # MLA 专用参数
+    kv_lora_rank: int = 512,
+    q_lora_rank: int = 1536,
+    rope_head_dim: int = 64,
+    v_head_dim: int = 128,
+    # StreamingLLM 参数
     sink_size: int = 4,
     streaming_window_size: int = 4096,
     **kwargs,
@@ -71,6 +83,11 @@ def create_attention(
         use_gqa: 是否使用GQA（分组查询注意力）
         use_chunked: 是否使用分块注意力（节省内存）
         use_streaming_llm: 是否使用StreamingLLM（无限长度推理）
+        use_mla: 是否使用MLA（Multi-Head Latent Attention）
+        kv_lora_rank: MLA KV压缩维度
+        q_lora_rank: MLA Q压缩维度
+        rope_head_dim: MLA RoPE维度
+        v_head_dim: MLA V维度
         sink_size: Attention Sink数量
         streaming_window_size: 滑动窗口大小
         **kwargs: 其他参数
@@ -79,13 +96,31 @@ def create_attention(
         最优的Attention模块实例
 
     选择逻辑:
-        1. 如果use_streaming_llm=True → StreamingAttention
-        2. 如果use_gqa=True → GroupedQueryAttention
-        3. 如果use_flash=True且GPU可用 → FlashAttention
-        4. 如果use_chunked=True → ChunkedAttention
-        5. 否则 → StandardAttention
+        1. 如果use_mla=True → MultiHeadLatentAttention
+        2. 如果use_streaming_llm=True → StreamingAttention
+        3. 如果use_gqa=True → GroupedQueryAttention
+        4. 如果use_flash=True且GPU可用 → FlashAttention
+        5. 如果use_chunked=True → ChunkedAttention
+        6. 否则 → StandardAttention
     """
     head_dim = head_dim or hidden_size // num_attention_heads
+
+    # 最高优先级：MLA
+    if use_mla:
+        return MultiHeadLatentAttention(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            head_dim=head_dim,
+            kv_lora_rank=kv_lora_rank,
+            q_lora_rank=q_lora_rank,
+            rope_head_dim=rope_head_dim,
+            v_head_dim=v_head_dim,
+            attention_dropout=attention_dropout,
+            hidden_dropout=hidden_dropout,
+            max_position_embeddings=max_position_embeddings,
+            use_flash_attn=use_flash,
+            **kwargs,
+        )
 
     # 优先使用 StreamingLLM
     if use_streaming_llm:
@@ -210,6 +245,8 @@ __all__ = [
     "MultiQueryAttention",
     "StreamingAttention",
     "StreamingKVCache",
+    "MultiHeadLatentAttention",
+    "MLAKVCache",
 
     # 兼容性别名
     "Attention",
