@@ -16,7 +16,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .config import CrawlerConfig, SiteConfig
-from .storage.database import Database, create_sqlite_db
+from .storage.database import create_sqlite_db, get_crawler_repo
 from .storage.file_storage import FileStorage
 from src.utils.logging import Logger, setup_logger
 from src.utils.metrics import MetricsTracker
@@ -252,7 +252,7 @@ class AsyncCrawler:
         site_config: SiteConfig,
         logger: Optional[Logger] = None,
         metrics: Optional[MetricsTracker] = None,
-        database: Optional[Database] = None,
+        database: Optional[object] = None,  # 兼容 LegacyDatabase
         file_storage: Optional[FileStorage] = None,
     ):
         self.config = config

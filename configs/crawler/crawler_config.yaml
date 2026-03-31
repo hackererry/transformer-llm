@@ -1,7 +1,7 @@
 # 爬虫配置文件
 global:
   delay: 2.0          # 请求间隔2秒
-  max_pages: 30        # 每个站点最多30页
+  max_pages: 2        # 每个站点最多30页
   depth: 3             # 爬取深度
   max_concurrent: 2    # 每个站点最大并发数
 

@@ -20,6 +20,32 @@ from .document_converter import (
     JSONExtractor,
 )
 
+from .deduplicate import (
+    exact_deduplicate,
+    near_deduplicate,
+    deduplicate_lines,
+    deduplicate_lines_from_text,
+)
+
+from .pii_remover import (
+    remove_pii,
+    remove_pii_with_count,
+    has_pii,
+)
+
+from .quality_filter import (
+    compute_quality_score,
+    filter_by_quality,
+    filter_by_quality_with_stats,
+)
+
+from .pipeline import (
+    CleaningPipeline,
+    build_light_pipeline,
+    build_standard_pipeline,
+    stream_clean_pipeline,
+)
+
 __all__ = [
     # 文本清洗
     "TextCleaner",
@@ -35,4 +61,22 @@ __all__ = [
     "PDFExtractor",
     "CSVExtractor",
     "JSONExtractor",
+    # 去重
+    "exact_deduplicate",
+    "near_deduplicate",
+    "deduplicate_lines",
+    "deduplicate_lines_from_text",
+    # PII 移除
+    "remove_pii",
+    "remove_pii_with_count",
+    "has_pii",
+    # 质量过滤
+    "compute_quality_score",
+    "filter_by_quality",
+    "filter_by_quality_with_stats",
+    # 流水线
+    "CleaningPipeline",
+    "build_light_pipeline",
+    "build_standard_pipeline",
+    "stream_clean_pipeline",
 ]

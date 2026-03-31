@@ -3,11 +3,51 @@
 提供训练过程中的日志记录功能
 """
 import os
+import sys
 import logging
 import time
+import io
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 import json
+
+
+class UTF8StreamHandler(logging.StreamHandler):
+    """支持 UTF-8 编码的 StreamHandler，解决 Windows GBK 编码问题"""
+
+    def __init__(self, stream=None):
+        # Windows 下强制使用 UTF-8 编码
+        if sys.platform == "win32":
+            if stream is None:
+                stream = sys.stdout
+            # 获取原始二进制流并用 UTF-8 TextIOWrapper 包装
+            if hasattr(stream, 'buffer'):
+                raw_stream = stream.buffer
+            else:
+                raw_stream = stream
+            wrapped = io.TextIOWrapper(raw_stream, encoding='utf-8', errors='replace')
+            super().__init__(wrapped)
+        else:
+            super().__init__(stream)
+
+    def emit(self, record):
+        """重写 emit 方法，确保 UTF-8 编码输出"""
+        try:
+            # 确保使用 UTF-8 编码
+            if sys.platform == "win32" and hasattr(self.stream, 'reconfigure'):
+                try:
+                    self.stream.reconfigure(encoding='utf-8', errors='replace')
+                except Exception:
+                    pass
+            super().emit(record)
+        except UnicodeEncodeError:
+            # 备用方案：直接写入字节
+            try:
+                msg = self.format(record) + self.terminator
+                self.stream.buffer.write(msg.encode('utf-8', errors='replace'))
+                self.stream.buffer.flush()
+            except Exception:
+                pass
 
 
 class Logger:
@@ -44,7 +84,11 @@ class Logger:
 
         # 文件handler
         log_file = os.path.join(log_dir, f"{experiment_name}.log")
-        file_handler = logging.FileHandler(log_file)
+        # Windows 下使用 UTF-8 编码
+        if sys.platform == "win32":
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        else:
+            file_handler = logging.FileHandler(log_file)
         file_handler.setLevel(log_level)
         file_formatter = logging.Formatter(
             "%(asctime)s - %(levelname)s - %(message)s",
@@ -55,7 +99,7 @@ class Logger:
 
         # 控制台handler
         if console_output:
-            console_handler = logging.StreamHandler()
+            console_handler = UTF8StreamHandler()
             console_handler.setLevel(log_level)
             console_formatter = logging.Formatter("%(message)s")
             console_handler.setFormatter(console_formatter)

@@ -28,12 +28,6 @@ from .training import (
     CheckpointManager,
 )
 
-from .cpu_optim import (
-    enable_gradient_checkpointing,
-    optimize_for_cpu_training,
-    MemoryMonitor,
-)
-
 from .utils import (
     setup_logger,
     set_seed,
@@ -61,10 +55,6 @@ __all__ = [
     "create_optimizer",
     "create_scheduler",
     "CheckpointManager",
-    # 优化
-    "enable_gradient_checkpointing",
-    "optimize_for_cpu_training",
-    "MemoryMonitor",
     # 工具
     "setup_logger",
     "set_seed",

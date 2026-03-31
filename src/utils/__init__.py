@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 工具模块
 导出所有工具函数
@@ -40,6 +41,28 @@ from .profiling import (
     ModelOptimizationConfig,
     format_memory_size,
 )
+from .database import (
+    DatabaseManager,
+    get_default_db_path,
+    init_database,
+    get_connection,
+    backup_database,
+)
+from .database_schema import (
+    init_all_tables,
+    drop_all_tables,
+    get_all_schemas,
+)
+from .repository import (
+    CrawlerPageRepository,
+    CrawlStatsRepository,
+    CleanedDocumentRepository,
+    CleaningRunRepository,
+    get_crawler_page_repo,
+    get_crawl_stats_repo,
+    get_cleaned_document_repo,
+    get_cleaning_run_repo,
+)
 
 __all__ = [
     # 日志
@@ -76,4 +99,23 @@ __all__ = [
     "FlashAttentionMetrics",
     "ModelOptimizationConfig",
     "format_memory_size",
+    # 数据库管理器
+    "DatabaseManager",
+    "get_default_db_path",
+    "init_database",
+    "get_connection",
+    "backup_database",
+    # 数据库表
+    "init_all_tables",
+    "drop_all_tables",
+    "get_all_schemas",
+    # Repository
+    "CrawlerPageRepository",
+    "CrawlStatsRepository",
+    "CleanedDocumentRepository",
+    "CleaningRunRepository",
+    "get_crawler_page_repo",
+    "get_crawl_stats_repo",
+    "get_cleaned_document_repo",
+    "get_cleaning_run_repo",
 ]
