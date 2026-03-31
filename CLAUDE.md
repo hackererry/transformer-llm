@@ -11,7 +11,6 @@ src/
 ├── model/          # 模型层 - Transformer架构实现
 ├── data/           # 数据层 - tokenizer、数据集、collator
 ├── training/       # 训练层 - 统一Trainer、optimizer、scheduler
-├── cpu_optim/      # CPU优化 - 梯度检查点、内存优化
 └── utils/          # 工具层 - 设备管理、日志、性能监控
 ```
 

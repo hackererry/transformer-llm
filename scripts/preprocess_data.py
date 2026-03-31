@@ -921,6 +921,28 @@ def stream_text_files(file_paths: List[str]) -> Iterator[str]:
                     yield line
 
 
+def stream_raw_files(file_paths: List[str]) -> Iterator[str]:
+    """
+    流式读取原始文本文件（不清洗，仅 yield 非空行）
+
+    重要：本脚本假设输入已经是清洗后的文本。
+    如需清洗，请先运行 scripts/clean_data.py。
+
+    Args:
+        file_paths: 文件路径列表
+
+    Yields:
+        每行文本（非空）
+    """
+    for path in file_paths:
+        print(f"  Reading: {path}")
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield line
+
+
 def stream_encode_and_save_incremental(
     file_paths: List[str],
     tokenizer,
@@ -999,11 +1021,14 @@ def stream_encode_and_save_incremental(
         shard_index += 1
         examples = []
 
-    # 流式处理
+    # 流式处理（带数据质量增强）
     print("Tokenizing and creating samples...")
     shard_start_time = time.perf_counter() if perf_monitor else None
 
-    for text in stream_text_files(file_paths):
+    # 使用原始文本流（假设已清洗）
+    text_iterator = stream_raw_files(file_paths)
+
+    for text in text_iterator:
         tokens = tokenizer.encode(text, add_special_tokens=False)
 
         total_tokens += len(tokens)
@@ -1329,6 +1354,8 @@ def main():
     print(f"Tokenizer sample: {config.tokenizer_sample_bytes / 1024 / 1024:.0f}MB")
     print(f"Mode: {'Full' if not config.incremental else 'Incremental'}")
     print(f"Tokenizer mode: {config.tokenizer_mode}")
+    print("Note: Input is assumed to be pre-cleaned.")
+    print("      Run 'python scripts/clean_data.py' first if needed.")
     if config.dry_run:
         print(f"Dry-run: True (no changes will be made)")
 

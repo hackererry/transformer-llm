@@ -111,6 +111,87 @@ class TextCleaner:
         return text
 
     @staticmethod
+    def remove_book_metadata(text: str) -> str:
+        """
+        移除书籍元数据：CIP、ISBN、版权页、出版社信息等
+
+        针对从 PDF/TXT 提取的书籍内容，清洗出版相关的元信息
+        """
+        patterns = [
+            # CIP 数据区（多行）
+            r'图书在版编目[^\n]*\n[^\n]*',
+            # ISBN 号
+            r'ISBN\s*[\d\-]+',
+            # 出版社信息（常见格式）
+            r'出版社\s*[：:]\s*[^\n]+',
+            r'出\s*版\s*[：:]\s*[^\n]+',
+            # 作者、译者行
+            r'作\s*者\s*[：:]\s*[^\n]+',
+            r'译\s*者\s*[：:]\s*[^\n]+',
+            r'责\s*任\s*编\s*辑\s*[：:]\s*[^\n]+',
+            r'文\s*字\s*编\s*辑\s*[：:]\s*[^\n]+',
+            r'美\s*术\s*编\s*辑\s*[：:]\s*[^\n]+',
+            # 出版信息
+            r'定\s*价\s*[：:]\s*[^\n]+',
+            r'版\s*次\s*[：:]\s*[^\n]+',
+            r'开\s*本\s*[：:]\s*[^\n]+',
+            r'字\s*数\s*[：:]\s*[^\n]+',
+            r'书\s*号\s*[：:]\s*[^\n]+',
+            # 中国图书馆 CIP 核字
+            r'中国版本图书馆CIP数据核字[^\n]+',
+            r'京权图字[^\n]+',
+            # 版权声明
+            r'版权[^\n]*必究[^\n]*',
+            r'中青版图书，版权所有，盗版必究[^\n]*',
+            # 英文原版版权信息
+            r'by\s+\S+[^\n]*Copyright[^\n]+',
+            r'Simplified\s+Chinese\s+translation\s+copyright[^\n]+',
+            # 购买链接、网址行
+            r'购\s*书\s*网\s*址\s*[：:]\s*[^\n]+',
+            r'公\s*司\s*网\s*址\s*[：:]\s*[^\n]+',
+            r'电\s*话\s*[：:]\s*[^\n]+',
+            # 发行信息
+            r'发\s*行\s*[：:]\s*[^\n]+',
+        ]
+
+        for pattern in patterns:
+            text = re.sub(pattern, '', text)
+
+        return text
+
+    @staticmethod
+    def remove_format_markers(text: str) -> str:
+        """
+        移除格式符号：====、----、第X章----、脚注标记等
+
+        针对书籍排版时添加的分隔线和注释标记
+        """
+        patterns = [
+            # 连续等号分隔线（可能有空格）
+            r'={3,}\s*',
+            # 连续短横线分隔线
+            r'-{3,}\s*',
+            # 波浪线分隔线
+            r'～{2,}\s*',
+            # 第X章后面紧跟的横线（常见于 "第 3 章 ---"）
+            r'第\s*\d+\s*章\s*-{2,}',
+            # 章节框/引用框（中文书名号内的章节注释）
+            r'「[^」]*」',
+            r'『[^』]*』',
+            # 脚注标记 [1] [2] 等
+            r'\[\d+\]',
+            # 带内容的脚注 [1] 注释文字
+            r'\[\d+\s*[^\]]*\]',
+            # 上标数字（如第1章后的[1]）
+            r'(?<=\S)\[\d+\](?=\s|$)',
+        ]
+
+        for pattern in patterns:
+            text = re.sub(pattern, '', text)
+
+        return text
+
+    @staticmethod
     def split_into_sentences(text: str, min_length: int = 10) -> List[str]:
         """
         将文本分割成句子
@@ -177,6 +258,10 @@ def clean_file(
     cleaner.add_cleaner(TextCleaner.fix_encoding_issues)
     cleaner.add_cleaner(TextCleaner.remove_empty_lines)
     cleaner.add_cleaner(TextCleaner.remove_extra_whitespace)
+
+    # 添加书籍元数据清洗
+    cleaner.add_cleaner(TextCleaner.remove_book_metadata)
+    cleaner.add_cleaner(TextCleaner.remove_format_markers)
 
     if remove_urls:
         cleaner.add_cleaner(TextCleaner.remove_urls)

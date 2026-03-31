@@ -19,38 +19,35 @@ if sys.platform == 'win32':
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.crawler.engine import crawl_sites
-from src.crawler.storage.database import create_sqlite_db
+from src.crawler.storage.database import create_sqlite_db, get_crawl_stats_repo
 from src.utils.logging import setup_logger
 
 
 DEFAULT_CONFIG = "configs/crawler/crawler_config.yaml"
 
 
-def status_command(output_dir: str = "./output/crawled") -> bool:
+def status_command() -> bool:
     """显示爬虫状态"""
-    db_path = os.path.join(output_dir, "crawler.db")
+    try:
+        page_repo = get_crawl_stats_repo()
+        crawled_count = page_repo.get_crawled_count()
+        stats = page_repo.get_recent_stats(days=1)
 
-    if not os.path.exists(db_path):
-        print("No crawl data found. Run a crawl first.")
+        print("\n=== Crawler Status ===")
+        print(f"\nPages crawled: {crawled_count}")
+
+        if stats:
+            print(f"\nToday's Stats:")
+            for s in stats:
+                print(f"  Pages crawled: {s['pages_crawled']}")
+                print(f"  Pages failed: {s['pages_failed']}")
+                print(f"  Bytes downloaded: {s['bytes_downloaded'] / 1024 / 1024:.2f} MB")
+                print(f"  Time: {s['total_time']:.1f}s")
+
+        return True
+    except Exception as e:
+        print(f"Error: {e}")
         return False
-
-    database = create_sqlite_db(db_path)
-    crawled_count = database.get_crawled_count()
-    stats = database.get_stats(days=1)
-
-    print("\n=== Crawler Status ===")
-    print(f"\nPages crawled: {crawled_count}")
-
-    if stats:
-        print(f"\nToday's Stats:")
-        for s in stats:
-            print(f"  Pages crawled: {s['pages_crawled']}")
-            print(f"  Pages failed: {s['pages_failed']}")
-            print(f"  Bytes downloaded: {s['bytes_downloaded'] / 1024 / 1024:.2f} MB")
-            print(f"  Time: {s['total_time']:.1f}s")
-
-    database.close()
-    return True
 
 
 def main():
@@ -84,7 +81,7 @@ def main():
         sys.exit(0 if success > 0 else 1)
 
     elif args.command == 'status':
-        success = status_command(output_dir=args.output_dir)
+        success = status_command()
         sys.exit(0 if success else 1)
 
     else:
