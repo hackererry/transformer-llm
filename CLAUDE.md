@@ -149,7 +149,7 @@ TrainingConfig(
     dataloader_num_workers=0,      # CPU训练建议0
 )
 ```
-
+### 规则6：所有python程序的运行都必须跑在new_venv虚拟环境下
 ## 关键特性
 
 ### 1. 自动设备检测

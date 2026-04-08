@@ -19,7 +19,7 @@ from src.data import (
     ShardedPreprocessedDataset,
 )
 from src.training import Trainer, TrainingConfig, save_pretrained
-from src.utils import set_seed, print_device_info, get_memory_info, OptimizationProfiler
+from src.utils import set_seed, print_device_info, get_memory_info, OptimizationProfiler, setup_logger
 
 
 def parse_args():
@@ -34,8 +34,8 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default=None,
                         help="预训练模型路径（用于继续训练）")
     parser.add_argument("--model_config", type=str, default="small",
-                        choices=["tiny", "small", "medium", "moe_small", "moe_medium"],
-                        help="模型配置: tiny(~1M)/small(~6M)/medium(~50M) 使用FFN, moe_small/moe_medium 使用MoE")
+                        choices=["tiny", "small", "base", "medium", "moe_small", "moe_medium"],
+                        help="模型配置: tiny/small/base/medium 使用FFN, moe_small/moe_medium 使用MoE")
 
     # 训练参数
     parser.add_argument("--output_dir", type=str, default="./output", help="输出目录")
@@ -67,30 +67,45 @@ def parse_args():
                         help="禁用GQA分组查询注意力（默认启用）")
     parser.add_argument("--rope_scaling_factor", type=float, default=4.0,
                         help="YaRN长度外推因子（默认4.0，支持4倍外推）")
+    parser.add_argument("--hidden_dropout", type=float, default=None,
+                        help="隐藏层dropout率（默认0.1）")
+    parser.add_argument("--attention_dropout", type=float, default=None,
+                        help="注意力dropout率（默认0.1）")
 
-    # MoE 配置参数（默认启用）
+    # MoE 配置参数（尊重模型配置默认值）
+    parser.add_argument("--use_moe", action="store_true",
+                        help="显式启用 MoE（覆盖模型配置默认值）")
     parser.add_argument("--no_moe", action="store_true",
-                        help="禁用 MoE，使用标准 FFN（默认启用 MoE）")
-    parser.add_argument("--num_experts", type=int, default=8,
-                        help="专家数量（默认8）")
-    parser.add_argument("--num_experts_per_tok", type=int, default=2,
-                        help="每个 token 激活的专家数（默认2）")
-    parser.add_argument("--aux_loss_alpha", type=float, default=0.01,
-                        help="MoE 负载均衡损失系数（默认0.01）")
+                        help="禁用 MoE，使用标准 FFN")
+    parser.add_argument("--num_experts", type=int, default=None,
+                        help="专家数量")
+    parser.add_argument("--num_experts_per_tok", type=int, default=None,
+                        help="每个 token 激活的专家数")
+    parser.add_argument("--aux_loss_alpha", type=float, default=None,
+                        help="MoE 负载均衡损失系数")
 
-    # MLA 配置参数（默认启用）
+    # MLA 配置参数（尊重模型配置默认值）
+    parser.add_argument("--use_mla", action="store_true",
+                        help="显式启用 MLA（覆盖模型配置默认值）")
     parser.add_argument("--no_mla", action="store_true",
-                        help="禁用 MLA，使用标准 Attention（默认启用 MLA）")
-    parser.add_argument("--kv_lora_rank", type=int, default=512,
-                        help="MLA KV 压缩维度（默认512）")
-    parser.add_argument("--q_lora_rank", type=int, default=1536,
-                        help="MLA Q 压缩维度（默认1536）")
+                        help="禁用 MLA，使用标准 Attention")
+    parser.add_argument("--kv_lora_rank", type=int, default=None,
+                        help="MLA KV 压缩维度")
+    parser.add_argument("--q_lora_rank", type=int, default=None,
+                        help="MLA Q 压缩维度")
 
     # 日志和保存
     parser.add_argument("--logging_dir", type=str, default="./logs", help="日志目录")
     parser.add_argument("--logging_steps", type=int, default=10, help="日志间隔")
     parser.add_argument("--save_steps", type=int, default=500, help="保存间隔")
+    parser.add_argument("--eval_steps", type=int, default=500, help="评估间隔")
     parser.add_argument("--save_total_limit", type=int, default=3, help="检查点数量限制")
+
+    # Early stopping
+    parser.add_argument("--early_stopping_patience", type=int, default=0,
+                        help="容忍的连续未改善评估次数（0=不启用）")
+    parser.add_argument("--early_stopping_threshold", type=float, default=0.0,
+                        help="最小改善阈值（绝对值），loss改善小于此值不算改善")
 
     # 其他
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -100,37 +115,22 @@ def parse_args():
 
 
 def detect_device_and_configure(args):
-    """自动检测设备并配置精度参数"""
+    """自动检测设备并配置精度参数（设备信息由 Trainer._setup_device 输出）"""
     if torch.cuda.is_available():
-        device_type = "cuda"
         capability = torch.cuda.get_device_capability()
-        gpu_name = torch.cuda.get_device_name(0)
-
-        print(f"\n{'='*60}")
-        print(f"  GPU Detected: {gpu_name}")
-        print(f"  Compute Capability: {capability[0]}.{capability[1]}")
-        print(f"{'='*60}")
 
         # 自动选择精度
         if args.bf16 is True:
-            precision = "BF16"
+            pass  # 用户显式指定
         elif args.fp16 is True:
-            precision = "FP16"
+            pass  # 用户显式指定
         elif capability[0] >= 8:  # Ampere+ (RTX 30/40 series)
-            precision = "BF16"
             args.bf16 = True
             args.fp16 = False
         else:
-            precision = "FP16"
             args.bf16 = False
             args.fp16 = True
-
-        print(f"  Using {precision} precision")
-        print(f"{'='*60}\n")
     else:
-        print(f"\n{'='*60}")
-        print(f"  No GPU detected, using CPU")
-        print(f"{'='*60}\n")
         args.bf16 = False
         args.fp16 = False
 
@@ -164,11 +164,12 @@ def load_or_create_model(args, config):
 
 def load_datasets(args):
     """加载训练和验证数据集（仅支持预处理数据）"""
-    # 使用预处理数据
+    # 使用预处理数据，惰性加载避免 OOM
     train_dataset = ShardedPreprocessedDataset(
         data_dir=args.preprocessed_data,
         prefix="train",
-        shuffle=False,
+        shuffle=True,       # 启用两级 shuffle
+        preload=False,      # 不一次性加载所有数据
     )
 
     eval_dataset = None
@@ -183,13 +184,16 @@ def load_datasets(args):
     return train_dataset, eval_dataset
 
 
-def load_tokenizer(args):
+def load_tokenizer(args, logger=None):
     """加载tokenizer（从预处理数据目录）"""
     # 从预处理数据目录加载tokenizer
     tokenizer_path = os.path.join(args.preprocessed_data, "tokenizer")
     if os.path.exists(tokenizer_path):
         tokenizer = get_tokenizer(tokenizer_path, tokenizer_type="bpe", use_fast=True)
-        print(f"Loaded tokenizer from {tokenizer_path}")
+        if logger:
+            logger.info(f"Loaded tokenizer from {tokenizer_path}")
+        else:
+            print(f"Loaded tokenizer from {tokenizer_path}")
         return tokenizer, tokenizer.vocab_size
     else:
         raise FileNotFoundError(f"Tokenizer not found in {tokenizer_path}")
@@ -201,26 +205,26 @@ def main():
     # 设置随机种子
     set_seed(args.seed)
 
-    # 自动检测设备并配置
-    detect_device_and_configure(args)
+    # 设置日志
+    logger = setup_logger(args.logging_dir, "pretrain")
 
-    # 打印设备信息
-    print_device_info()
+    # 自动检测设备并配置（设备信息由 Trainer._setup_device 输出）
+    detect_device_and_configure(args)
 
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("=" * 60)
-    print("Starting Pretraining")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Starting Pretraining")
+    logger.info("=" * 60)
 
     # 验证输入（仅支持预处理数据）
     if not args.preprocessed_data:
-        print("Error: 必须提供 --preprocessed_data")
+        logger.error("Error: 必须提供 --preprocessed_data")
         return
 
     # 加载tokenizer并获取词汇表大小
-    tokenizer, vocab_size = load_tokenizer(args)
+    tokenizer, vocab_size = load_tokenizer(args, logger)
 
     # 从预处理数据获取max_seq_length
     dataset_info_path = os.path.join(args.preprocessed_data, "dataset_info.json")
@@ -228,13 +232,18 @@ def main():
     if os.path.exists(dataset_info_path):
         with open(dataset_info_path, 'r', encoding='utf-8') as f:
             dataset_info = json.load(f)
-            max_seq_length = dataset_info.get("max_seq_length", 512)
+            # 兼容 v3.0（config 下）和 v2.0（顶层）两种格式
+            config_info = dataset_info.get("config", {})
+            max_seq_length = config_info.get("max_seq_length",
+                dataset_info.get("max_seq_length", 512))
 
     # 模型配置
     if args.model_config == "tiny":
         config = ModelConfig.tiny()
     elif args.model_config == "small":
         config = ModelConfig.small()
+    elif args.model_config == "base":
+        config = ModelConfig.base()
     elif args.model_config == "medium":
         config = ModelConfig.medium()
     elif args.model_config == "moe_small":
@@ -255,25 +264,40 @@ def main():
         config.num_key_value_heads = config.num_attention_heads  # 禁用GQA
     if args.rope_scaling_factor != 4.0:
         config.rope_scaling = {"type": "yarn", "factor": args.rope_scaling_factor}
+    if args.hidden_dropout is not None:
+        config.hidden_dropout = args.hidden_dropout
+    if args.attention_dropout is not None:
+        config.attention_dropout = args.attention_dropout
 
-    # 应用 MoE 配置（默认启用，可禁用）
+    # 应用 MoE 配置（尊重模型配置默认值，仅在用户显式指定时覆盖）
     if args.no_moe:
         config.use_moe = False
-    else:
+    elif args.use_moe:
         config.use_moe = True
-        config.num_experts = args.num_experts
-        config.num_experts_per_tok = args.num_experts_per_tok
-        config.aux_loss_alpha = args.aux_loss_alpha
 
-    # 应用 MLA 配置（默认启用，可禁用）
+    # 仅在 MoE 启用时应用 MoE 参数
+    if config.use_moe:
+        if args.num_experts is not None:
+            config.num_experts = args.num_experts
+        if args.num_experts_per_tok is not None:
+            config.num_experts_per_tok = args.num_experts_per_tok
+        if args.aux_loss_alpha is not None:
+            config.aux_loss_alpha = args.aux_loss_alpha
+
+    # 应用 MLA 配置（尊重模型配置默认值，仅在用户显式指定时覆盖）
     if args.no_mla:
         config.use_mla = False
-    else:
+    elif args.use_mla:
         config.use_mla = True
-        config.kv_lora_rank = args.kv_lora_rank
-        config.q_lora_rank = args.q_lora_rank
 
-    print(f"Model config: {config.to_dict()}")
+    # 仅在 MLA 启用时应用 MLA 参数
+    if config.use_mla:
+        if args.kv_lora_rank is not None:
+            config.kv_lora_rank = args.kv_lora_rank
+        if args.q_lora_rank is not None:
+            config.q_lora_rank = min(args.q_lora_rank, config.hidden_size)
+
+    logger.info(f"Model config: {config.to_dict()}")
 
     # 创建优化项性能分析器
     profiler = OptimizationProfiler()
@@ -330,15 +354,19 @@ def main():
     model, config = load_or_create_model(args, config)
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params:,}")
-    print(f"Memory info: {get_memory_info()}")
+    logger.info(f"Total parameters: {total_params:,}")
+    logger.info(f"Memory info: {get_memory_info()}")
 
     # 加载数据集
     train_dataset, eval_dataset = load_datasets(args)
 
-    print(f"Training samples: {len(train_dataset)}")
+    logger.info(f"Training samples: {len(train_dataset)}")
+    logger.info(f"Data loading mode: {'lazy (shard-by-shard)' if not train_dataset.preload else 'preloaded'}")
+    if not train_dataset.preload:
+        logger.info(f"Shards: {train_dataset.num_shards}")
+        logger.info(f"Prefetch: enabled (background thread)")
     if eval_dataset:
-        print(f"Validation samples: {len(eval_dataset)}")
+        logger.info(f"Validation samples: {len(eval_dataset)}")
 
     # 数据整理器
     collate_fn = get_collator(
@@ -367,9 +395,12 @@ def main():
         logging_dir=args.logging_dir,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
         save_total_limit=args.save_total_limit,
         seed=args.seed,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_threshold=args.early_stopping_threshold,
     )
 
     # 创建训练器
@@ -380,16 +411,17 @@ def main():
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         collate_fn=collate_fn,
+        logger=logger,
     )
 
     # 开始训练
     results = trainer.train()
 
-    print(f"\nTraining completed!")
-    print(f"Final loss: {results['final_loss']:.4f}")
-    print(f"Global step: {results['global_step']}")
+    logger.info(f"\nTraining completed!")
+    logger.info(f"Final loss: {results['final_loss']:.4f}")
+    logger.info(f"Global step: {results['global_step']}")
     if 'training_time' in results:
-        print(f"Training time: {results['training_time']/3600:.2f} hours")
+        logger.info(f"Training time: {results['training_time']/3600:.2f} hours")
 
     # 打印优化项性能报告
     profiler.print_report()
@@ -405,7 +437,10 @@ def main():
     # 保存最终模型
     final_model_path = os.path.join(args.output_dir, "final_model")
     save_pretrained(model, final_model_path, tokenizer)
-    print(f"Final model saved to {final_model_path}")
+    logger.info(f"Final model saved to {final_model_path}")
+
+    # 关闭日志（保存指标历史）
+    logger.close()
 
 
 if __name__ == "__main__":

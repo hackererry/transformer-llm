@@ -82,7 +82,7 @@ class TokenizerPolicy:
 class PreprocessConfig:
     """预处理配置"""
     train_files: List[str]
-    validation_file: Optional[str]
+    validation_files: List[str]  # 统一为文件列表，空列表表示无验证数据
     output_dir: str
     max_seq_length: int = 512
     vocab_size: int = 32000
@@ -204,7 +204,11 @@ def parse_args():
     input_group.add_argument("--train_files", type=str, nargs="+", default=None,
                              help="训练数据文件列表")
     input_group.add_argument("--validation_file", type=str, default=None,
-                             help="验证数据文件路径")
+                             help="验证数据文件路径（单个文件）")
+    input_group.add_argument("--validation_files", type=str, nargs="+", default=None,
+                             help="验证数据文件列表（多个文件）")
+    input_group.add_argument("--validation_dir", type=str, default=None,
+                             help="验证数据目录（自动扫描所有 .txt 文件）")
 
     # 输出配置
     output_group = parser.add_argument_group("输出配置")
@@ -257,6 +261,11 @@ def parse_args():
     if args.force_reprocess:
         args.incremental = False
 
+    # 验证集参数互斥检查
+    val_sources = sum(1 for v in [args.validation_file, args.validation_files, args.validation_dir] if v is not None)
+    if val_sources > 1:
+        parser.error("--validation_file, --validation_files, --validation_dir 三者互斥，只能选择其中一种")
+
     return args
 
 
@@ -308,7 +317,6 @@ def create_dataset_info_v3(
         "summary": {
             "total_files": 0,
             "total_shards": 0,
-            "total_examples": 0,
             "next_shard_index": 0,
         },
     }
@@ -364,8 +372,6 @@ def migrate_dataset_info_v2_to_v3(old_info: Dict[str, Any], output_dir: str) -> 
         },
         "shards": {
             "train_000.pt": {
-                "index": 0,
-                "source_files": ["file1.txt"],
                 "num_examples": 5000
             }
         },
@@ -387,7 +393,6 @@ def migrate_dataset_info_v2_to_v3(old_info: Dict[str, Any], output_dir: str) -> 
         "summary": {
             "total_files": 0,
             "total_shards": 0,
-            "total_examples": 0,
             "next_shard_index": 0,
         },
     }
@@ -406,11 +411,9 @@ def migrate_dataset_info_v2_to_v3(old_info: Dict[str, Any], output_dir: str) -> 
             "status": "legacy",  # 标记为遗留数据
             "shards": train_shard_files.copy(),
             "num_examples": train_metadata.get("num_examples", 0) // max(len(file_hashes), 1),
-            "full_path": file_path,
         }
 
     # 构建 shards 信息
-    total_examples = train_metadata.get("num_examples", 0)
     for idx, shard_file in enumerate(train_shard_files):
         # 从现有分片读取实际样本数
         shard_path = os.path.join(output_dir, shard_file)
@@ -421,11 +424,8 @@ def migrate_dataset_info_v2_to_v3(old_info: Dict[str, Any], output_dir: str) -> 
             num_examples = train_metadata.get("num_examples", 0) // max(len(train_shard_files), 1)
 
         new_info["shards"][shard_file] = {
-            "index": idx,
-            "source_files": list(new_info["files"].keys()),  # 所有文件
             "num_examples": num_examples,
         }
-        new_info["summary"]["total_examples"] += num_examples
 
     new_info["summary"]["total_files"] = len(new_info["files"])
     new_info["summary"]["total_shards"] = len(train_shard_files)
@@ -496,7 +496,7 @@ def detect_file_changes(
         if file_name not in current_basenames:
             old_info = recorded_files[file_name]
             changes.append(FileChange(
-                file_path=old_info.get("full_path", file_name),
+                file_path=file_name,
                 change_type="deleted",
                 old_hash=old_info.get("hash"),
                 new_hash=None,
@@ -702,14 +702,11 @@ def incremental_add_new_files(
             "status": "processed",
             "shards": shard_files.copy(),
             "num_examples": file_metadata.get(file_name, {}).get("num_examples", 0),
-            "full_path": file_path,
         }
 
     # 更新分片信息
     for shard_file in shard_files:
         dataset_info["shards"][shard_file] = {
-            "index": next_shard_index,
-            "source_files": [os.path.basename(f) for f in new_files],
             "num_examples": metadata.get("shard_examples", {}).get(shard_file, 0),
         }
         next_shard_index += 1
@@ -717,7 +714,6 @@ def incremental_add_new_files(
     # 更新摘要
     dataset_info["summary"]["total_files"] = len(dataset_info["files"])
     dataset_info["summary"]["total_shards"] = len(dataset_info["shards"])
-    dataset_info["summary"]["total_examples"] += metadata.get("num_examples", 0)
     dataset_info["summary"]["next_shard_index"] = next_shard_index
 
     return dataset_info
@@ -788,14 +784,11 @@ def handle_modified_files(
             "status": "processed",
             "shards": shard_files,
             "num_examples": file_metadata.get(file_name, {}).get("num_examples", 0),
-            "full_path": change.file_path,
         }
 
         # 更新分片信息
         for shard_file in shard_files:
             dataset_info["shards"][shard_file] = {
-                "index": next_shard_index,
-                "source_files": [file_name],
                 "num_examples": metadata.get("shard_examples", {}).get(shard_file, 0),
             }
             next_shard_index += 1
@@ -804,9 +797,6 @@ def handle_modified_files(
 
     # 重新计算摘要
     dataset_info["summary"]["total_shards"] = len(dataset_info["shards"])
-    dataset_info["summary"]["total_examples"] = sum(
-        s.get("num_examples", 0) for s in dataset_info["shards"].values()
-    )
 
     return dataset_info
 
@@ -1006,7 +996,6 @@ def stream_encode_and_save_incremental(
             "num_examples": len(examples),
             "shard_index": shard_index,
             "total_tokens": total_tokens,
-            "source_files": [os.path.basename(f) for f in file_paths],
         }
 
         save_preprocessed_data(
@@ -1173,13 +1162,13 @@ def full_preprocess(
     # 编码验证数据
     val_shard_files = None
     val_metadata = None
-    if config.validation_file:
+    if config.validation_files:
         print(f"\n{'='*60}")
-        print("Step 3: Encoding Validation Data")
+        print(f"Step 3: Encoding Validation Data ({len(config.validation_files)} file(s))")
         print(f"{'='*60}")
 
         val_shard_files, val_metadata = stream_encode_and_save(
-            file_paths=[config.validation_file],
+            file_paths=config.validation_files,
             tokenizer=tokenizer,
             max_seq_length=config.max_seq_length,
             output_dir=config.output_dir,
@@ -1199,21 +1188,17 @@ def full_preprocess(
             "status": "processed",
             "shards": train_shard_files.copy(),
             "num_examples": train_metadata.get("num_examples", 0) // len(config.train_files),
-            "full_path": file_path,
         }
 
     # 添加分片信息
     for idx, shard_file in enumerate(train_shard_files):
         dataset_info["shards"][shard_file] = {
-            "index": idx,
-            "source_files": [os.path.basename(f) for f in config.train_files],
             "num_examples": train_metadata.get("shard_examples", {}).get(shard_file, 0),
         }
 
     # 更新摘要
     dataset_info["summary"]["total_files"] = len(config.train_files)
     dataset_info["summary"]["total_shards"] = len(train_shard_files)
-    dataset_info["summary"]["total_examples"] = train_metadata.get("num_examples", 0)
     dataset_info["summary"]["next_shard_index"] = len(train_shard_files)
 
     save_dataset_info(config.output_dir, dataset_info)
@@ -1326,9 +1311,23 @@ def main():
     else:
         train_files = args.train_files
 
+    # 解析验证文件
+    if args.validation_dir:
+        validation_files = scan_text_files(args.validation_dir)
+        if not validation_files:
+            print(f"Error: No .txt files found in {args.validation_dir}")
+            return
+        print(f"Found {len(validation_files)} validation files in {args.validation_dir}")
+    elif args.validation_files:
+        validation_files = args.validation_files
+    elif args.validation_file:
+        validation_files = [args.validation_file]
+    else:
+        validation_files = []
+
     config = PreprocessConfig(
         train_files=train_files,
-        validation_file=args.validation_file,
+        validation_files=validation_files,
         output_dir=args.output_dir,
         max_seq_length=args.max_seq_length,
         vocab_size=args.vocab_size,
@@ -1385,7 +1384,7 @@ def main():
     print(f"  ├── train_000.pt")
     print(f"  ├── train_001.pt")
     print(f"  ├── ... (shards)")
-    if config.validation_file:
+    if config.validation_files:
         print(f"  ├── val_000.pt")
     print(f"  ├── tokenizer/")
     print(f"  │   └── tokenizer.json")

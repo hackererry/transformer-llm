@@ -6,7 +6,6 @@
 
 ```
 src/crawler/
-├── cli.py              # 命令行接口
 ├── engine.py           # 爬虫引擎（httpx + BeautifulSoup）
 ├── config.py           # CrawlerConfig / SiteConfig — 配置管理
 ├── browser/            # 浏览器自动化
@@ -25,22 +24,6 @@ src/crawler/
 ```
 
 ## 核心组件
-
-### cli.py — 命令行接口
-
-```bash
-# 批量爬取
-python -m src.crawler.cli run
-
-# 指定配置和并行数
-python -m src.crawler.cli run --config configs/crawler/crawler_config.yaml --parallel 3
-
-# 指定输出目录
-python -m src.crawler.cli run --output-dir ./crawled --parallel 2
-
-# 查看爬虫状态
-python -m src.crawler.cli status
-```
 
 ### engine.py — 爬虫引擎
 

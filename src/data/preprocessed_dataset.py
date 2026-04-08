@@ -4,7 +4,10 @@
 支持分片加载以避免内存溢出
 """
 import os
+import gc
 import json
+import random
+import threading
 import torch
 from torch.utils.data import Dataset, IterableDataset
 from typing import Dict, Any, Optional, List, Iterator
@@ -96,10 +99,10 @@ class PreprocessedDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         item = self.examples[idx]
-        return {
-            "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
-            "labels": torch.tensor(item["labels"], dtype=torch.long),
-        }
+        result = {"input_ids": item["input_ids"], "labels": item["labels"]}
+        if "attention_mask" in item:
+            result["attention_mask"] = item["attention_mask"]
+        return result
 
     def get_metadata(self) -> Dict[str, Any]:
         """获取数据集元数据"""
@@ -150,12 +153,12 @@ class ShardedPreprocessedDataset(IterableDataset):
         dataset = ShardedPreprocessedDataset(
             data_dir="./preprocessed_data",
             prefix="train",
-            num_shards=10,
-            metadata_check={"max_seq_length": 512},
+            shuffle=True,
+            preload=False,  # 默认惰性加载
         )
 
         # DataLoader 会自动按需加载分片
-        dataloader = DataLoader(dataset, batch_size=8, num_workers=4)
+        dataloader = DataLoader(dataset, batch_size=8)
     """
 
     def __init__(
@@ -166,7 +169,7 @@ class ShardedPreprocessedDataset(IterableDataset):
         metadata_check: Optional[Dict[str, Any]] = None,
         shuffle: bool = False,
         seed: int = 42,
-        preload: bool = True,
+        preload: bool = False,
     ):
         """
         Args:
@@ -174,9 +177,9 @@ class ShardedPreprocessedDataset(IterableDataset):
             prefix: 数据文件前缀 (如 "train", "val")
             num_shards: 分片总数（如果为None，从目录扫描）
             metadata_check: 需要验证的元数据
-            shuffle: 是否打乱分片顺序
+            shuffle: 是否启用两级 shuffle（分片间 + 分片内）
             seed: 随机种子
-            preload: 是否在初始化时预加载所有分片到内存（提升训练速度）
+            preload: 是否在初始化时预加载所有分片到内存
         """
         self.data_dir = data_dir
         self.prefix = prefix
@@ -195,13 +198,41 @@ class ShardedPreprocessedDataset(IterableDataset):
         if self.num_shards == 0:
             raise ValueError(f"No shards found in {data_dir} with prefix {prefix}")
 
-        # 预加载所有分片到内存（性能优化）
         self.preload = preload
         self._all_examples: Optional[List[Dict]] = None
         self._total_examples: Optional[int] = None
+        self._epoch: int = 0
 
         if self.preload:
             self._preload_all_shards()
+            print(f"  Mode: PRELOAD (all {self.num_shards} shards loaded)")
+        else:
+            self._load_manifest()
+            print(f"  Mode: LAZY (shard-by-shard, prefetch enabled)")
+            print(f"  Total shards: {self.num_shards}")
+            if self._total_examples is not None:
+                print(f"  Total examples: {self._total_examples} (from manifest)")
+
+    def _load_manifest(self):
+        """从 dataset_info.json 加载元数据（不加载实际数据）"""
+        info_path = os.path.join(self.data_dir, "dataset_info.json")
+        if os.path.exists(info_path):
+            with open(info_path, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            # 提取每个分片的样本数
+            shards_info = info.get("shards", {})
+            self._shard_example_counts = {}
+            for shard_file in self.shard_files:
+                shard_info = shards_info.get(shard_file, {})
+                self._shard_example_counts[shard_file] = shard_info.get("num_examples", 0)
+            # 优先使用当前 prefix 匹配到的分片总数，避免 val 误用全局总数
+            shard_total = sum(self._shard_example_counts.values())
+            if shard_total > 0:
+                self._total_examples = shard_total
+            # 否则保持 None，由 __len__ 回退到加载分片计数
+        else:
+            # 无 manifest，回退到加载分片计数
+            self._shard_example_counts = None
 
     def _discover_shards(self) -> List[str]:
         """发现目录下所有匹配的分片文件"""
@@ -248,8 +279,6 @@ class ShardedPreprocessedDataset(IterableDataset):
             raise IndexError(f"Shard index {shard_index} out of range (total {len(self.shard_files)})")
 
         shard_path = os.path.join(self.data_dir, self.shard_files[shard_index])
-        print(f"Loading shard {shard_index + 1}/{len(self.shard_files)}: {self.shard_files[shard_index]}")
-
         data = torch.load(shard_path, map_location="cpu", weights_only=False)
 
         # 验证元数据
@@ -266,11 +295,14 @@ class ShardedPreprocessedDataset(IterableDataset):
 
     def _get_shuffled_indices(self) -> List[int]:
         """获取打乱后的样本索引顺序"""
-        import random
-        g = random.Random(self.seed)
+        g = random.Random(self.seed + self._epoch)
         indices = list(range(self._total_examples))
         g.shuffle(indices)
         return indices
+
+    def set_epoch(self, epoch: int):
+        """设置当前 epoch（用于每 epoch 不同的 shuffle 顺序）"""
+        self._epoch = epoch
 
     def __iter__(self) -> Iterator:
         """迭代器，每次返回一个样本"""
@@ -280,25 +312,74 @@ class ShardedPreprocessedDataset(IterableDataset):
                 indices = self._get_shuffled_indices()
                 for idx in indices:
                     item = self._all_examples[idx]
-                    yield {
-                        "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
-                        "labels": torch.tensor(item["labels"], dtype=torch.long),
-                    }
+                    result = {"input_ids": item["input_ids"], "labels": item["labels"]}
+                    if "attention_mask" in item:
+                        result["attention_mask"] = item["attention_mask"]
+                    yield result
             else:
                 for item in self._all_examples:
-                    yield {
-                        "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
-                        "labels": torch.tensor(item["labels"], dtype=torch.long),
-                    }
+                    result = {"input_ids": item["input_ids"], "labels": item["labels"]}
+                    if "attention_mask" in item:
+                        result["attention_mask"] = item["attention_mask"]
+                    yield result
         else:
-            # 非预加载模式：动态加载（内存友好但速度慢）
-            for shard_idx in range(self.num_shards):
-                examples = self._load_shard(shard_idx)
+            # 惰性加载模式：分片级 + 分片内两级 shuffle，后台预取
+            rng = random.Random(self.seed + self._epoch)
+            shard_indices = list(range(self.num_shards))
+            if self.shuffle:
+                rng.shuffle(shard_indices)  # 第一级：分片间 shuffle
+
+            # 预取缓冲区
+            prefetched_examples = None
+            prefetch_thread = None
+            prefetch_error = None
+
+            def _prefetch(shard_idx):
+                nonlocal prefetched_examples, prefetch_error
+                try:
+                    prefetched_examples = self._load_shard(shard_idx)
+                except Exception as e:
+                    prefetch_error = e
+
+            for i, shard_idx in enumerate(shard_indices):
+                # 获取当前分片数据
+                if i == 0:
+                    # 第一个分片：同步加载
+                    examples = self._load_shard(shard_idx)
+                else:
+                    # 等待预取完成
+                    if prefetch_thread is not None:
+                        prefetch_thread.join()
+                    if prefetch_error is not None:
+                        raise prefetch_error
+                    examples = prefetched_examples
+                    prefetched_examples = None
+
+                # 启动下一个分片的预取（后台线程）
+                prefetch_thread = None
+                if i + 1 < len(shard_indices):
+                    prefetch_thread = threading.Thread(
+                        target=_prefetch,
+                        args=(shard_indices[i + 1],),
+                        daemon=True,
+                    )
+                    prefetch_thread.start()
+
+                # 第二级：分片内 shuffle
+                if self.shuffle:
+                    rng.shuffle(examples)
+
+                # 产出当前分片的样本（直接传 list，避免 tensor→list→tensor 往返）
                 for item in examples:
-                    yield {
-                        "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
-                        "labels": torch.tensor(item["labels"], dtype=torch.long),
-                    }
+                    result = {"input_ids": item["input_ids"], "labels": item["labels"]}
+                    if "attention_mask" in item:
+                        result["attention_mask"] = item["attention_mask"]
+                    yield result
+                del examples
+
+            # 等待最后一个预取线程结束（清理）
+            if prefetch_thread is not None:
+                prefetch_thread.join()
 
     def __len__(self) -> int:
         """返回总样本数"""
@@ -306,7 +387,7 @@ class ShardedPreprocessedDataset(IterableDataset):
             return self._total_examples
         if self._all_examples is not None:
             return len(self._all_examples)
-        # 如果没有预加载，需要加载所有分片统计
+        # 如果没有 manifest 且没有预加载，回退到加载分片统计
         if not hasattr(self, "_cached_len"):
             total = 0
             for shard_file in self.shard_files:
@@ -322,7 +403,7 @@ def create_sharded_dataset(
     prefix: str = "train",
     num_shards: int = None,
     metadata_check: Optional[Dict[str, Any]] = None,
-    preload: bool = True,
+    preload: bool = False,
     **kwargs,
 ) -> ShardedPreprocessedDataset:
     """

@@ -114,40 +114,26 @@ class DataCollatorForCausalLM:
         else:
             max_len = self.max_length or max(len(ids) for ids in input_ids)
 
-        # Padding
-        padded_inputs = []
-        attention_masks = []
-        labels = []
+        batch_size = len(input_ids)
 
-        for ids in input_ids:
+        # 预分配 batch tensor（避免逐样本创建再 stack）
+        input_ids_tensor = torch.full((batch_size, max_len), self.pad_token_id, dtype=torch.long)
+        attention_mask_tensor = torch.zeros(batch_size, max_len, dtype=torch.long)
+        labels_tensor = torch.full((batch_size, max_len), -100, dtype=torch.long)
+
+        for i, ids in enumerate(input_ids):
             if isinstance(ids, torch.Tensor):
                 ids = ids.tolist()
-
             # 截断
-            if len(ids) > max_len:
-                ids = ids[:max_len]
-
-            # 创建attention mask
-            att_mask = [1] * len(ids)
-
-            # 创建labels (input_ids的副本)
-            lbl = ids.copy()
-
-            # Padding
-            padding_length = max_len - len(ids)
-            if padding_length > 0:
-                ids = ids + [self.pad_token_id] * padding_length
-                att_mask = att_mask + [0] * padding_length
-                lbl = lbl + [-100] * padding_length
-
-            padded_inputs.append(torch.tensor(ids, dtype=torch.long))
-            attention_masks.append(torch.tensor(att_mask, dtype=torch.long))
-            labels.append(torch.tensor(lbl, dtype=torch.long))
+            seq_len = min(len(ids), max_len)
+            input_ids_tensor[i, :seq_len] = torch.tensor(ids[:seq_len], dtype=torch.long)
+            attention_mask_tensor[i, :seq_len] = 1
+            labels_tensor[i, :seq_len] = torch.tensor(ids[:seq_len], dtype=torch.long)
 
         return {
-            "input_ids": torch.stack(padded_inputs),
-            "attention_mask": torch.stack(attention_masks),
-            "labels": torch.stack(labels),
+            "input_ids": input_ids_tensor,
+            "attention_mask": attention_mask_tensor,
+            "labels": labels_tensor,
         }
 
 

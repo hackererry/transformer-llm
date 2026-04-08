@@ -7,7 +7,7 @@
 ```
 src/data_processing/
 ├── clean_text.py        # TextCleaner — 文本清洗
-├── document_converter.py # PDF / EPUB / CSV / JSON → TXT
+├── document_converter.py # PDF / EPUB / CSV / JSON / Parquet → TXT
 ├── deduplicate.py        # 精确去重 / 近似去重 / 行级去重
 ├── pii_remover.py       # PII 脱敏（手机号、邮箱、身份证等）
 ├── quality_filter.py    # 质量评分与过滤
@@ -46,13 +46,17 @@ src/data_processing/
 
 ```bash
 # 清洗单个文件
-python -m src.data_processing.clean_text clean input.txt -o cleaned.txt
+python scripts/clean_data.py -i input.txt -o cleaned.txt
 
 # 批量清洗目录
-python -m src.data_processing.clean_text clean -d ./raw_data -o ./cleaned_data
+python scripts/clean_data.py -i ./raw_data -o ./cleaned_data
+```
+
+```python
+from src.data_processing.clean_text import split_large_file
 
 # 分割大文件
-python -m src.data_processing.clean_text split large.txt -o ./chunks --max-chars 1000000
+split_large_file("large.txt", "./chunks", max_chars=1000000)
 ```
 
 ### document_converter.py — 文档转换
@@ -65,28 +69,32 @@ python -m src.data_processing.clean_text split large.txt -o ./chunks --max-chars
 | PDF | `PDFExtractor` | 文本提取，支持扫描 PDF |
 | CSV | `CSVExtractor` | 表格数据拼接 |
 | JSON | `JSONExtractor` | JSON 字段提取和拼接 |
+| Parquet | `ParquetExtractor` | 大文件流式读取，支持 ~100MB 分片输出 |
 
 | 函数 | 说明 |
 |------|------|
 | `convert_to_txt(input, output)` | 通用转换（自动检测格式） |
+| `convert_parquet_to_txt(input, output, max_file_size)` | Parquet 转 TXT（支持分片） |
 | `epub_to_txt(input, output)` | EPUB 转 TXT |
 | `batch_convert(input_dir, output_dir, workers)` | 批量转换（并发） |
 | `merge_txt_files(input_dir, output_file)` | 合并多个 TXT |
 
 **使用示例：**
 
-```bash
+```python
+from src.data_processing import batch_convert, merge_txt_files, convert_to_txt
+
 # 单个文件转换
-python -m src.data_processing.document_converter book.epub -o output.txt
+convert_to_txt("book.epub", "output.txt")
 
 # 批量转换（自动使用 CPU 核数并发）
-python -m src.data_processing.document_converter -d ./documents -o ./txt_output
+txt_files = batch_convert("./documents", "./txt_output")
 
 # 指定并发线程数
-python -m src.data_processing.document_converter -d ./documents -w 4
+txt_files = batch_convert("./documents", "./txt_output", max_workers=4)
 
 # 批量转换并合并
-python -m src.data_processing.document_converter -d ./documents --merge merged.txt
+merge_txt_files(txt_files, "merged.txt")
 ```
 
 ### deduplicate.py — 去重
@@ -210,16 +218,22 @@ python scripts/clean_data.py --db db/cleaning.db --input ./raw_data --output ./c
 
 ## 完整数据清洗流程
 
-```bash
+```python
+from src.data_processing import batch_convert, merge_txt_files
+from src.data_processing.clean_text import clean_file, split_large_file
+
 # 1. 文档转换
-python -m src.data_processing.document_converter -d ./documents --merge raw.txt
+txt_files = batch_convert("./documents")
+merge_txt_files(txt_files, "raw.txt")
 
 # 2. 文本清洗
-python -m src.data_processing.clean_text clean raw.txt -o cleaned.txt
+clean_file("raw.txt", "cleaned.txt")
 
 # 3. 分割大文件
-python -m src.data_processing.clean_text split cleaned.txt -o ./chunks --max-chars 1000000
+split_large_file("cleaned.txt", "./chunks", max_chars=1000000)
+```
 
+```bash
 # 4. 数据预处理
 python scripts/preprocess_data.py --train_dir ./chunks --output_dir output/preprocessed
 ```

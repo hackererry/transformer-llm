@@ -196,6 +196,8 @@ class MultiHeadLatentAttention(AttentionBase):
 
         # Flash Attention 支持
         self.use_flash_attn = use_flash_attn and self._check_flash_attention()
+        # PyTorch SDPA fallback（不需要额外安装）
+        self.use_sdpa = not self.use_flash_attn and self._check_sdpa_available()
 
         # 初始化权重
         self._init_weights()
@@ -223,6 +225,10 @@ class MultiHeadLatentAttention(AttentionBase):
             return torch.cuda.is_available()
         except ImportError:
             return False
+
+    def _check_sdpa_available(self) -> bool:
+        """检查 PyTorch 内置 SDPA 是否可用（PyTorch 2.0+）"""
+        return hasattr(F, 'scaled_dot_product_attention') and torch.cuda.is_available()
 
     def _init_weights(self):
         """初始化权重"""
@@ -363,6 +369,8 @@ class MultiHeadLatentAttention(AttentionBase):
         # 8. 注意力计算
         if self.use_flash_attn and hidden_states.device.type == "cuda":
             attn_output = self._flash_attention(q, k, v)
+        elif self.use_sdpa and hidden_states.device.type == "cuda":
+            attn_output = self._sdpa_attention(q, k, v)
         else:
             attn_output = self._standard_attention(q, k, v, attention_mask)
 
@@ -373,6 +381,59 @@ class MultiHeadLatentAttention(AttentionBase):
         output = self.resid_dropout(output)
 
         return output, present_key_value
+
+    def _sdpa_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        使用 PyTorch 内置的 scaled_dot_product_attention（SDPA）
+        支持 Flash Attention / Memory-Efficient Attention 自动选择
+
+        Args:
+            q: [batch, num_heads, q_seq, head_dim]
+            k: [batch, num_heads, kv_seq, head_dim]
+            v: [batch, num_heads, kv_seq, v_head_dim]
+
+        Returns:
+            output: [batch, num_heads, q_seq, v_head_dim]
+        """
+        scale = 1.0 / math.sqrt(self.rope_head_dim + self.qk_nope_head_dim)
+
+        # SDPA 要求 KV 序列长度维度上的 head_dim 一致
+        # 当 v_head_dim != head_dim 时，需要将 K 和 V 的 head_dim 对齐
+        if self.v_head_dim != self.head_dim:
+            head_dim = self.head_dim
+            # Pad V to match head_dim, or pad K to match v_head_dim
+            if self.v_head_dim < head_dim:
+                v = F.pad(v, (0, head_dim - self.v_head_dim))
+            else:
+                k = F.pad(k, (0, self.v_head_dim - head_dim))
+                head_dim = self.v_head_dim
+
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=True,
+                scale=scale,
+            )
+
+            # 移除 padding
+            if self.v_head_dim < self.head_dim:
+                output = output[..., :self.v_head_dim]
+        else:
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=True,
+                scale=scale,
+            )
+
+        return output
 
     def _standard_attention(
         self,

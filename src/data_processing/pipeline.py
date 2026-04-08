@@ -13,7 +13,8 @@ from typing import (
 from .clean_text import TextCleaner
 from .pii_remover import (
     remove_pii, remove_pii_with_count,
-    PII_PATTERNS, PII_PLACEHOLDERS, COMPOUND_PATTERNS
+    PII_PATTERNS, PII_PLACEHOLDERS, COMPOUND_PATTERNS,
+    CONTEXT_PII_PATTERNS,
 )
 from .deduplicate import (
     deduplicate_lines_from_text,
@@ -189,6 +190,9 @@ def build_standard_pipeline(
     # Step 2: 特殊字符移除
     pipeline.add(TextCleaner.remove_special_chars)
 
+    # Step 2.5: 移除微信标签残留
+    pipeline.add(TextCleaner.remove_wechat_tags)
+
     # Step 3: URL 移除（文本类杂质）
     # 注意：邮箱由 pii_remover 统一处理（remove_pii=True 时），
     # 不在这里单独处理，避免重复替换导致行为不一致
@@ -241,6 +245,7 @@ def stream_clean_pipeline(
     encoding: str = "utf-8",
     db: Optional[CleaningDatabase] = None,
     run_id: Optional[str] = None,
+    skip_db_write: bool = False,
 ) -> dict:
     """
     一站式流式清洗函数（供 CLI 直接调用）
@@ -258,9 +263,10 @@ def stream_clean_pipeline(
         encoding: 文件编码
         db: 数据库实例（可选，用于存储清洗结果）
         run_id: 运行ID（可选）
+        skip_db_write: 跳过数据库写入，将 doc_data 放入返回的 stats["doc_data"] 中（用于并发模式）
 
     Returns:
-        处理统计字典
+        处理统计字典（skip_db_write=True 时包含 "doc_data" 键）
     """
     import hashlib
 
@@ -274,11 +280,20 @@ def stream_clean_pipeline(
 
     start_time = time.time()
 
-    # 计算原始文件信息
+    # 计算原始文件信息（提前计算 MD5，避免后续文件句柄泄露）
     original_size = 0
+    original_md5 = ""
     if os.path.exists(input_path):
         original_size = os.path.getsize(input_path)
-    original_md5 = ""
+        with open(input_path, "rb") as f:
+            original_md5 = hashlib.md5(f.read()).hexdigest()
+
+    # 如果数据库中已有该文件，跳过处理
+    if db is not None and original_md5 and db.is_document_processed(original_md5):
+        if show_progress:
+            print(f"    Skipped (already processed): {input_path}")
+        stats["skipped"] = True
+        return stats
 
     # 第一遍：读取并清洗所有行
     cleaned_lines: List[Tuple[str, str]] = []  # (line_hash, cleaned_line)
@@ -297,6 +312,9 @@ def stream_clean_pipeline(
 
             # 特殊字符
             line = TextCleaner.remove_special_chars(line)
+
+            # 微信标签残留
+            line = TextCleaner.remove_wechat_tags(line)
 
             # URL
             if remove_urls:
@@ -375,7 +393,8 @@ def stream_clean_pipeline(
         cleaned_md5 = hashlib.md5(("\n".join(output_lines)).encode(encoding)).hexdigest()
 
     # 写入数据库（如果指定了 db）
-    if db is not None:
+    doc_data = None
+    if db is not None or skip_db_write:
         cleaned_content = "\n".join(output_lines)
         cleaned_size = len(cleaned_content.encode(encoding))
 
@@ -387,7 +406,7 @@ def stream_clean_pipeline(
 
         doc_data = {
             "original_file_path": os.path.abspath(input_path),
-            "original_md5": original_md5 or hashlib.md5(open(input_path, "rb").read()).hexdigest(),
+            "original_md5": original_md5,
             "cleaned_md5": cleaned_md5,
             "cleaned_content": cleaned_content,
             "original_size": original_size,
@@ -398,7 +417,10 @@ def stream_clean_pipeline(
             "quality_filtered": stats["quality_filtered"],
             "dedup_filtered": stats["dedup_filtered"],
         }
-        db.save_cleaned_document(doc_data, run_id)
+        if skip_db_write:
+            stats["doc_data"] = doc_data
+        elif db is not None:
+            db.save_cleaned_document(doc_data, run_id)
 
     elapsed = time.time() - start_time
     if show_progress:

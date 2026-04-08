@@ -561,5 +561,145 @@ class TestTrainer:
         assert trainer.collate_fn is not None
 
 
+class TestEarlyStopping:
+    """Early stopping 功能测试"""
+
+    def test_early_stopping_triggered(self, tmp_path):
+        """测试 early stopping 触发：eval loss 不改善时提前终止"""
+        model = SimpleLMModel(vocab_size=100, hidden_size=64)
+
+        # 固定数据集，loss 不会改善
+        torch.manual_seed(42)
+        data = torch.randint(0, 100, (40, 16))
+
+        class FixedDataset(torch.utils.data.Dataset):
+            def __len__(self):
+                return len(data)
+
+            def __getitem__(self, idx):
+                return {
+                    "input_ids": data[idx],
+                    "labels": data[idx],
+                }
+
+        train_dataset = FixedDataset()
+        eval_dataset = FixedDataset()
+
+        config = TrainingConfig(
+            output_dir=str(tmp_path),
+            num_train_epochs=10,  # 设置足够多的 epoch
+            per_device_train_batch_size=2,
+            eval_steps=2,         # 每 2 步评估一次
+            logging_steps=1,
+            save_steps=999,       # 避免保存检查点干扰
+            early_stopping_patience=3,
+            early_stopping_threshold=0.0,
+            bf16=False,
+            learning_rate=1e-6,   # 极小学习率，确保 loss 不会改善
+        )
+
+        trainer = Trainer(
+            model=model,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            config=config,
+        )
+
+        results = trainer.train()
+
+        # 验证 early stopping 被触发
+        assert results["early_stopped"] is True
+        # 训练应在所有 epoch 结束前停止
+        assert results["global_step"] < 10 * (40 // 2)  # 远小于总步数
+
+    def test_early_stopping_disabled_by_default(self, tmp_path):
+        """测试默认 patience=0 时不启用 early stopping"""
+        model = SimpleLMModel(vocab_size=100, hidden_size=64)
+
+        torch.manual_seed(42)
+        data = torch.randint(0, 100, (20, 16))
+
+        class FixedDataset(torch.utils.data.Dataset):
+            def __len__(self):
+                return len(data)
+
+            def __getitem__(self, idx):
+                return {
+                    "input_ids": data[idx],
+                    "labels": data[idx],
+                }
+
+        train_dataset = FixedDataset()
+        eval_dataset = FixedDataset()
+
+        config = TrainingConfig(
+            output_dir=str(tmp_path),
+            num_train_epochs=2,
+            per_device_train_batch_size=2,
+            eval_steps=2,
+            logging_steps=1,
+            save_steps=999,
+            early_stopping_patience=0,  # 默认值，不启用
+            bf16=False,
+        )
+
+        trainer = Trainer(
+            model=model,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            config=config,
+        )
+
+        results = trainer.train()
+
+        # patience=0 时不触发 early stopping
+        assert results["early_stopped"] is False
+
+    def test_early_stopping_threshold(self, tmp_path):
+        """测试改善阈值：改善量小于阈值时计数器仍递增"""
+        model = SimpleLMModel(vocab_size=100, hidden_size=64)
+
+        torch.manual_seed(42)
+        data = torch.randint(0, 100, (40, 16))
+
+        class FixedDataset(torch.utils.data.Dataset):
+            def __len__(self):
+                return len(data)
+
+            def __getitem__(self, idx):
+                return {
+                    "input_ids": data[idx],
+                    "labels": data[idx],
+                }
+
+        train_dataset = FixedDataset()
+        eval_dataset = FixedDataset()
+
+        config = TrainingConfig(
+            output_dir=str(tmp_path),
+            num_train_epochs=10,
+            per_device_train_batch_size=2,
+            eval_steps=2,
+            logging_steps=1,
+            save_steps=999,
+            early_stopping_patience=3,
+            early_stopping_threshold=999.0,  # 极大阈值，几乎不可能改善这么多
+            bf16=False,
+            learning_rate=1e-6,
+        )
+
+        trainer = Trainer(
+            model=model,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            config=config,
+        )
+
+        results = trainer.train()
+
+        # 阈值极大时，即使 loss 略有改善也不算改善，应触发 early stopping
+        assert results["early_stopped"] is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
