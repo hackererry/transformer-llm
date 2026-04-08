@@ -25,6 +25,9 @@ Usage:
     # 禁用数据库存储
     python scripts/clean_data.py -I data/raw -O data/clean --no-db
 
+    # 并发清洗（4进程）
+    python scripts/clean_data.py -I data/raw -O data/clean --no-doc-dedup --workers 4
+
     # 使用内存数据库
     python scripts/clean_data.py -I data/raw -O data/clean --db memory
 """
@@ -33,6 +36,7 @@ import sys
 import time
 import argparse
 from typing import List, Optional, Dict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -128,6 +132,15 @@ def process_single_file(
 
     elapsed = time.time() - start_time
 
+    # 处理跳过的情况
+    if stats.get("skipped"):
+        print(f"  Skipped (already processed in database)")
+        stats["input_size_mb"] = file_size / 1024 / 1024
+        stats["output_size_mb"] = 0
+        stats["elapsed_seconds"] = elapsed
+        stats["throughput_mb_per_sec"] = 0
+        return stats
+
     # 补充统计
     stats["input_size_mb"] = file_size / 1024 / 1024
     if actual_output and os.path.exists(actual_output):
@@ -140,6 +153,36 @@ def process_single_file(
     return stats
 
 
+def _process_file_worker(
+    input_path: str,
+    output_path: Optional[str],
+    quality_threshold: float,
+    dedup_threshold: int,
+) -> dict:
+    """Worker 进程函数（模块顶层，可被 pickle）
+
+    仅执行 CPU 密集型清洗计算，不接触数据库。
+    返回 stats（含 doc_data）或错误信息。
+    """
+    try:
+        stats = stream_clean_pipeline(
+            input_path=input_path,
+            output_path=output_path,
+            remove_pii=True,
+            remove_urls=True,
+            remove_page_numbers=True,
+            quality_threshold=quality_threshold,
+            enable_dedup=True,
+            dedup_threshold=dedup_threshold,
+            show_progress=False,
+            db=None,
+            skip_db_write=True,
+        )
+        return {"stats": stats, "file": os.path.basename(input_path)}
+    except Exception as e:
+        return {"error": str(e), "file": os.path.basename(input_path)}
+
+
 def process_directory(
     input_dir: str,
     output_dir: str,
@@ -149,6 +192,7 @@ def process_directory(
     verbose: bool,
     db: Optional[CleaningDatabase] = None,
     db_only: bool = False,
+    workers: int = 1,
 ) -> List[dict]:
     """批量处理目录
 
@@ -161,6 +205,7 @@ def process_directory(
         verbose: 是否显示详细进度
         db: 数据库实例（可选）
         db_only: 是否仅写入数据库
+        workers: 并发进程数（默认1=串行）
     """
     input_files = scan_text_files(input_dir, recursive=recursive)
 
@@ -176,6 +221,8 @@ def process_directory(
         print(f"Database: enabled")
     if db_only:
         print("Mode: database only (no file output)")
+    if workers > 1:
+        print(f"Workers: {workers}")
     print("=" * 60)
 
     # 开始数据库运行记录
@@ -192,38 +239,125 @@ def process_directory(
     total_dedup_filtered = 0
     success_count = 0
     fail_count = 0
+    skip_count = 0
 
-    for idx, input_path in enumerate(input_files, 1):
-        if not db_only:
-            rel_path = os.path.relpath(input_path, input_dir)
-            output_path = os.path.join(output_dir, rel_path)
-            output_subdir = os.path.dirname(output_path)
+    # ---- 并发路径 (workers > 1) ----
+    if workers > 1:
+        # 预过滤已处理文件（MD5 检查）
+        files_to_process = input_files
+        if db:
+            processed_md5s = db.get_all_processed_md5s()
+            if processed_md5s:
+                filtered = []
+                for fpath in input_files:
+                    with open(fpath, "rb") as f:
+                        md5 = hashlib.md5(f.read()).hexdigest()
+                    if md5 not in processed_md5s:
+                        filtered.append(fpath)
+                    else:
+                        skip_count += 1
+                        if verbose:
+                            print(f"  Skipped (DB MD5): {os.path.basename(fpath)}")
+                skipped_by_db = len(input_files) - len(filtered)
+                if skipped_by_db > 0:
+                    print(f"  Skipped {skipped_by_db} already-processed files (DB MD5 check)")
+                files_to_process = filtered
 
-            if output_subdir:
-                os.makedirs(output_subdir, exist_ok=True)
-        else:
-            output_path = None
+        # 预创建所有输出目录
+        file_tasks = []
+        for input_path in files_to_process:
+            if not db_only:
+                rel_path = os.path.relpath(input_path, input_dir)
+                output_path = os.path.join(output_dir, rel_path)
+                output_subdir = os.path.dirname(output_path)
+                if output_subdir:
+                    os.makedirs(output_subdir, exist_ok=True)
+            else:
+                output_path = None
+            file_tasks.append((input_path, output_path))
 
-        print(f"\n[{idx}/{len(input_files)}] {os.path.basename(input_path)}")
+        total_tasks = len(file_tasks)
+        doc_data_list = []
+        completed = 0
 
-        stats = process_single_file(
-            input_path, output_path, quality_threshold, dedup_threshold,
-            verbose, db, run_id, db_only
-        )
-        all_stats.append({
-            "file": os.path.basename(input_path),
-            "stats": stats,
-        })
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for input_path, output_path in file_tasks:
+                future = executor.submit(
+                    _process_file_worker,
+                    input_path, output_path,
+                    quality_threshold, dedup_threshold,
+                )
+                futures[future] = input_path
 
-        if "error" not in stats:
-            success_count += 1
-            total_input_lines += stats.get("input_lines", 0)
-            total_output_lines += stats.get("output_lines", 0)
-            total_pii_detected += stats.get("pii_detected", 0)
-            total_quality_filtered += stats.get("quality_filtered", 0)
-            total_dedup_filtered += stats.get("dedup_filtered", 0)
-        else:
-            fail_count += 1
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                fname = result.get("file", "?")
+
+                if "error" in result:
+                    print(f"  [{completed}/{total_tasks}] {fname} - ERROR: {result['error']}")
+                    all_stats.append({"file": fname, "stats": {"error": result["error"]}})
+                    fail_count += 1
+                else:
+                    stats = result["stats"]
+                    if verbose:
+                        print(f"  [{completed}/{total_tasks}] {fname}: "
+                              f"{stats.get('input_lines', 0):,} -> {stats.get('output_lines', 0):,} lines")
+
+                    all_stats.append({"file": fname, "stats": stats})
+                    success_count += 1
+                    total_input_lines += stats.get("input_lines", 0)
+                    total_output_lines += stats.get("output_lines", 0)
+                    total_pii_detected += stats.get("pii_detected", 0)
+                    total_quality_filtered += stats.get("quality_filtered", 0)
+                    total_dedup_filtered += stats.get("dedup_filtered", 0)
+
+                    if "doc_data" in stats:
+                        doc_data_list.append(stats["doc_data"])
+
+        # 批量写入数据库
+        if db and doc_data_list:
+            batch_count = db.save_documents_batch(doc_data_list, run_id)
+            if verbose:
+                print(f"  Batch saved {batch_count} documents to DB")
+
+    # ---- 串行路径 (workers <= 1，原有逻辑) ----
+    else:
+        for idx, input_path in enumerate(input_files, 1):
+            if not db_only:
+                rel_path = os.path.relpath(input_path, input_dir)
+                output_path = os.path.join(output_dir, rel_path)
+                output_subdir = os.path.dirname(output_path)
+
+                if output_subdir:
+                    os.makedirs(output_subdir, exist_ok=True)
+            else:
+                output_path = None
+
+            print(f"\n[{idx}/{len(input_files)}] {os.path.basename(input_path)}")
+
+            stats = process_single_file(
+                input_path, output_path, quality_threshold, dedup_threshold,
+                verbose, db, run_id, db_only
+            )
+            all_stats.append({
+                "file": os.path.basename(input_path),
+                "stats": stats,
+            })
+
+            if "error" not in stats:
+                if stats.get("skipped"):
+                    skip_count += 1
+                else:
+                    success_count += 1
+                total_input_lines += stats.get("input_lines", 0)
+                total_output_lines += stats.get("output_lines", 0)
+                total_pii_detected += stats.get("pii_detected", 0)
+                total_quality_filtered += stats.get("quality_filtered", 0)
+                total_dedup_filtered += stats.get("dedup_filtered", 0)
+            else:
+                fail_count += 1
 
     # 结束数据库运行记录
     if db and run_id:
@@ -248,6 +382,7 @@ def process_directory(
     print("=" * 60)
     print(f"  Total files:        {len(input_files)}")
     print(f"  Success:            {success_count}")
+    print(f"  Skipped:            {skip_count}")
     print(f"  Failed:             {fail_count}")
     print(f"  Total input:        {total_input_lines:,} lines")
     print(f"  Total output:       {total_output_lines:,} lines")
@@ -309,10 +444,26 @@ def process_directory_with_doc_dedup(
     documents = []
     file_info = []  # (file_path, rel_path, content)
 
+    # 获取数据库中已处理的 MD5 集合，用于早期过滤
+    processed_md5s = set()
+    if db:
+        processed_md5s = db.get_all_processed_md5s()
+        if processed_md5s and verbose:
+            print(f"  DB already has {len(processed_md5s)} processed documents")
+
+    db_skip_count = 0
     for fpath in input_files:
         try:
-            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
+            with open(fpath, "rb") as f:
+                raw_content = f.read()
+            original_md5 = hashlib.md5(raw_content).hexdigest()
+
+            # 数据库级 MD5 过滤：跳过已处理文件
+            if processed_md5s and original_md5 in processed_md5s:
+                db_skip_count += 1
+                continue
+
+            content = raw_content.decode("utf-8", errors="ignore")
             if content.strip():
                 rel_path = os.path.relpath(fpath, input_dir)
                 documents.append(content)
@@ -321,7 +472,10 @@ def process_directory_with_doc_dedup(
             if verbose:
                 print(f"    Warning: Failed to read {fpath}: {e}")
 
-    total_files = len(documents)
+    total_files = len(file_info)
+    if db_skip_count > 0:
+        print(f"  Skipped {db_skip_count} already-processed files (DB MD5 check)")
+    print(f"Loaded {total_files} documents to process")
     print(f"Loaded {total_files} documents")
 
     # 第二步：文档级去重
@@ -377,6 +531,7 @@ def process_directory_with_doc_dedup(
     total_line_dedup_filtered = 0
     success_count = 0
     fail_count = 0
+    skip_count = 0
 
     for idx, (input_path, rel_path) in enumerate(keep_files, 1):
         if not db_only:
@@ -401,7 +556,10 @@ def process_directory_with_doc_dedup(
         })
 
         if "error" not in stats:
-            success_count += 1
+            if stats.get("skipped"):
+                skip_count += 1
+            else:
+                success_count += 1
             total_input_lines += stats.get("input_lines", 0)
             total_output_lines += stats.get("output_lines", 0)
             total_pii_detected += stats.get("pii_detected", 0)
@@ -434,7 +592,9 @@ def process_directory_with_doc_dedup(
     print(f"  Raw files:           {total_files}")
     print(f"  After doc dedup:    {len(keep_files)}")
     print(f"  Duplicates removed:  {duplicates}")
+    print(f"  DB skipped:         {db_skip_count}")
     print(f"  Success:            {success_count}")
+    print(f"  Skipped (pipeline): {skip_count}")
     print(f"  Failed:             {fail_count}")
     print(f"  Total input:        {total_input_lines:,} lines")
     print(f"  Total output:       {total_output_lines:,} lines")
@@ -483,6 +643,9 @@ Examples:
 
   # 目录清洗 + 近似去重
   python scripts/clean_data.py -I data/raw -O data/clean --dedup-level near
+
+  # 并发清洗（4进程，仅 --no-doc-dedup 模式有效）
+  python scripts/clean_data.py -I data/raw -O data/clean --no-doc-dedup --workers 4
         """,
     )
 
@@ -552,6 +715,10 @@ Examples:
     misc_group.add_argument(
         "--encoding", type=str, default="utf-8",
         help="输入文件编码（默认 utf-8）",
+    )
+    misc_group.add_argument(
+        "--workers", type=int, default=1,
+        help="并发进程数（默认1=串行，0=自动=CPU核数，仅 --no-doc-dedup 模式有效）",
     )
 
     # --- 数据库选项 ---
@@ -627,6 +794,12 @@ def main():
         print(f"Doc dedup level: {args.dedup_level}")
     print(f"Dry run: {args.dry_run}")
     print(f"Database: {not args.no_db}")
+
+    # 解析 workers 参数
+    workers = args.workers
+    if workers == 0:
+        workers = os.cpu_count() or 4
+    print(f"Workers: {workers}")
 
     # --- 导出模式 ---
     if args.export_dir is not None:
@@ -745,7 +918,7 @@ def main():
                 process_directory(
                     args.input_dir, output_dir or ".", args.quality_threshold,
                     args.dedup_threshold, args.recursive, args.verbose,
-                    db=db, db_only=args.db_only
+                    db=db, db_only=args.db_only, workers=workers
                 )
 
     print("=" * 60)

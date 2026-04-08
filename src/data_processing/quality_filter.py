@@ -78,8 +78,8 @@ def compute_quality_score(text: str) -> float:
     # 2.1 标点密度过低（几乎没有句号/逗号 = 可能是乱码）
     punct_count = len(re.findall(r'[。！？.!?;,:，、]', text))
     punct_ratio = punct_count / total_chars
-    if punct_ratio < 0.01:
-        score -= 0.2
+    if punct_ratio < 0.005:
+        score -= 0.1
 
     # 2.2 行长度异常
     lines = text.split('\n')
@@ -89,7 +89,7 @@ def compute_quality_score(text: str) -> float:
             avg_line_len = sum(len(l) for l in non_empty_lines) / len(non_empty_lines)
             if avg_line_len < 5:
                 score -= 0.15
-            elif avg_line_len > 1000:
+            elif avg_line_len > 5000:
                 score -= 0.1
 
     # 2.3 整篇文本过长（可能是日志、爬取残留）
@@ -109,14 +109,14 @@ def compute_quality_score(text: str) -> float:
     # 3.2 停用词密度过低（无意义片段，如随机字符串）
     if words:
         stop_ratio = sum(1 for w in words if w in CHINESE_STOP_WORDS) / len(words)
-        if stop_ratio < 0.03 and len(words) > 10:
-            score -= 0.2
+        if stop_ratio < 0.01 and len(words) > 10:
+            score -= 0.1
 
     # 3.3 句子比例过低（大量 token 但几乎无完整句子 = 被截断的片段）
     if words and len(words) > 10:
         sentence_count = len(re.findall(r'[。！？.!?]', text))
-        if sentence_count / len(words) < 0.03:
-            score -= 0.15
+        if sentence_count / len(words) < 0.02:
+            score -= 0.1
 
     # 3.4 数字/字母比例异常高（可能是表格、编码数据）
     alpha_count = len(re.findall(r'[a-zA-Z0-9]', text))
@@ -125,12 +125,16 @@ def compute_quality_score(text: str) -> float:
         score -= 0.15
 
     # 3.5 包含明显的爬虫/系统残留
-    system_keywords = ['http://', 'https://', 'www.', '.com', '.cn',
-                       'Copyright', '版权所有', 'All Rights Reserved']
+    system_keywords = ['http://', 'https://', 'Copyright', '版权所有']
     for kw in system_keywords:
         if kw in text:
             score -= 0.15
             break
+
+    # 3.6 中文字符占比高加分（含足够中文的行大概率是有价值的）
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    if total_chars > 0 and chinese_chars / total_chars > 0.3:
+        score += 0.2
 
     # 确保分数在 [0.0, 1.0] 范围内
     return max(0.0, min(1.0, score))

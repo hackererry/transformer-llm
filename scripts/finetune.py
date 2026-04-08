@@ -12,7 +12,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.model import ModelConfig, CausalLMModel
-from src.data import FinetuneDataset, get_collator, get_tokenizer
+from src.data import FinetuneDataset, ShardedFinetuneDataset, ShardedPreprocessedDataset, get_collator, get_tokenizer
 from src.training import Trainer, TrainingConfig, save_pretrained, load_model
 from src.utils import setup_logger, set_seed, print_device_info, OptimizationProfiler
 
@@ -22,10 +22,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="指令微调")
 
     # 数据参数
-    parser.add_argument("--train_file", type=str, required=True, help="训练数据文件路径")
+    parser.add_argument("--train_file", type=str, default=None, help="训练数据文件路径")
     parser.add_argument("--validation_file", type=str, default=None, help="验证数据文件路径")
     parser.add_argument("--template", type=str, default="alpaca", choices=["alpaca", "chat", "simple"],
                         help="指令模板类型")
+    parser.add_argument("--preprocessed_data", type=str, default=None,
+                        help="预处理数据目录（使用预处理数据时无需指定 train_file）")
 
     # 模型参数
     parser.add_argument("--model_path", type=str, default=None, help="预训练模型路径")
@@ -50,7 +52,14 @@ def parse_args():
     parser.add_argument("--logging_dir", type=str, default="./logs_sft", help="日志目录")
     parser.add_argument("--logging_steps", type=int, default=10, help="日志记录步数间隔")
     parser.add_argument("--save_steps", type=int, default=500, help="保存步数间隔")
+    parser.add_argument("--eval_steps", type=int, default=500, help="评估间隔")
     parser.add_argument("--save_total_limit", type=int, default=3, help="保存检查点数量限制")
+
+    # Early stopping
+    parser.add_argument("--early_stopping_patience", type=int, default=0,
+                        help="容忍的连续未改善评估次数（0=不启用）")
+    parser.add_argument("--early_stopping_threshold", type=float, default=0.0,
+                        help="最小改善阈值（绝对值），loss改善小于此值不算改善")
 
     # 优化参数
     parser.add_argument("--bf16", action="store_true", default=True, help="使用BF16精度")
@@ -65,23 +74,27 @@ def parse_args():
     parser.add_argument("--rope_scaling_factor", type=float, default=4.0,
                         help="YaRN长度外推因子（默认4.0，支持4倍外推）")
 
-    # MoE 配置参数（默认启用）
+    # MoE 配置参数（尊重模型配置默认值）
+    parser.add_argument("--use_moe", action="store_true",
+                        help="显式启用 MoE（覆盖模型配置默认值）")
     parser.add_argument("--no_moe", action="store_true",
-                        help="禁用 MoE，使用标准 FFN（默认启用 MoE）")
-    parser.add_argument("--num_experts", type=int, default=8,
-                        help="专家数量（默认8）")
-    parser.add_argument("--num_experts_per_tok", type=int, default=2,
-                        help="每个 token 激活的专家数（默认2）")
-    parser.add_argument("--aux_loss_alpha", type=float, default=0.01,
-                        help="MoE 负载均衡损失系数（默认0.01）")
+                        help="禁用 MoE，使用标准 FFN")
+    parser.add_argument("--num_experts", type=int, default=None,
+                        help="专家数量")
+    parser.add_argument("--num_experts_per_tok", type=int, default=None,
+                        help="每个 token 激活的专家数")
+    parser.add_argument("--aux_loss_alpha", type=float, default=None,
+                        help="MoE 负载均衡损失系数")
 
-    # MLA 配置参数（默认启用）
+    # MLA 配置参数（尊重模型配置默认值）
+    parser.add_argument("--use_mla", action="store_true",
+                        help="显式启用 MLA（覆盖模型配置默认值）")
     parser.add_argument("--no_mla", action="store_true",
-                        help="禁用 MLA，使用标准 Attention（默认启用 MLA）")
-    parser.add_argument("--kv_lora_rank", type=int, default=512,
-                        help="MLA KV 压缩维度（默认512）")
-    parser.add_argument("--q_lora_rank", type=int, default=1536,
-                        help="MLA Q 压缩维度（默认1536）")
+                        help="禁用 MLA，使用标准 Attention")
+    parser.add_argument("--kv_lora_rank", type=int, default=None,
+                        help="MLA KV 压缩维度")
+    parser.add_argument("--q_lora_rank", type=int, default=None,
+                        help="MLA Q 压缩维度")
 
     # 其他
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -132,22 +145,33 @@ def main():
         if args.rope_scaling_factor != 4.0:
             config.rope_scaling = {"type": "yarn", "factor": args.rope_scaling_factor}
 
-        # 应用 MoE 配置
+        # 应用 MoE 配置（尊重模型配置默认值，仅在用户显式指定时覆盖）
         if args.no_moe:
             config.use_moe = False
-        else:
+        elif args.use_moe:
             config.use_moe = True
-            config.num_experts = args.num_experts
-            config.num_experts_per_tok = args.num_experts_per_tok
-            config.aux_loss_alpha = args.aux_loss_alpha
 
-        # 应用 MLA 配置
+        # 仅在 MoE 启用时应用 MoE 参数
+        if config.use_moe:
+            if args.num_experts is not None:
+                config.num_experts = args.num_experts
+            if args.num_experts_per_tok is not None:
+                config.num_experts_per_tok = args.num_experts_per_tok
+            if args.aux_loss_alpha is not None:
+                config.aux_loss_alpha = args.aux_loss_alpha
+
+        # 应用 MLA 配置（尊重模型配置默认值，仅在用户显式指定时覆盖）
         if args.no_mla:
             config.use_mla = False
-        else:
+        elif args.use_mla:
             config.use_mla = True
-            config.kv_lora_rank = args.kv_lora_rank
-            config.q_lora_rank = args.q_lora_rank
+
+        # 仅在 MLA 启用时应用 MLA 参数
+        if config.use_mla:
+            if args.kv_lora_rank is not None:
+                config.kv_lora_rank = args.kv_lora_rank
+            if args.q_lora_rank is not None:
+                config.q_lora_rank = min(args.q_lora_rank, config.hidden_size)
 
         model = CausalLMModel(config)
         # 优先尝试加载 internal format (.pt)
@@ -185,22 +209,33 @@ def main():
         if args.rope_scaling_factor != 4.0:
             config.rope_scaling = {"type": "yarn", "factor": args.rope_scaling_factor}
 
-        # 应用 MoE 配置
+        # 应用 MoE 配置（尊重模型配置默认值，仅在用户显式指定时覆盖）
         if args.no_moe:
             config.use_moe = False
-        else:
+        elif args.use_moe:
             config.use_moe = True
-            config.num_experts = args.num_experts
-            config.num_experts_per_tok = args.num_experts_per_tok
-            config.aux_loss_alpha = args.aux_loss_alpha
 
-        # 应用 MLA 配置
+        # 仅在 MoE 启用时应用 MoE 参数
+        if config.use_moe:
+            if args.num_experts is not None:
+                config.num_experts = args.num_experts
+            if args.num_experts_per_tok is not None:
+                config.num_experts_per_tok = args.num_experts_per_tok
+            if args.aux_loss_alpha is not None:
+                config.aux_loss_alpha = args.aux_loss_alpha
+
+        # 应用 MLA 配置（尊重模型配置默认值，仅在用户显式指定时覆盖）
         if args.no_mla:
             config.use_mla = False
-        else:
+        elif args.use_mla:
             config.use_mla = True
-            config.kv_lora_rank = args.kv_lora_rank
-            config.q_lora_rank = args.q_lora_rank
+
+        # 仅在 MLA 启用时应用 MLA 参数
+        if config.use_mla:
+            if args.kv_lora_rank is not None:
+                config.kv_lora_rank = args.kv_lora_rank
+            if args.q_lora_rank is not None:
+                config.q_lora_rank = min(args.q_lora_rank, config.hidden_size)
 
         model = CausalLMModel(config)
 
@@ -262,31 +297,74 @@ def main():
     logger.info(f"Trainable parameters: {trainable_params:,}")
 
     # 加载tokenizer
-    if args.model_path:
+    if args.preprocessed_data:
+        # 预处理数据模式：从预处理目录加载 tokenizer
+        tokenizer_path = os.path.join(args.preprocessed_data, "tokenizer")
+        logger.info(f"Loading tokenizer from preprocessed data: {tokenizer_path}")
+        tokenizer = get_tokenizer(tokenizer_path, tokenizer_type="bpe")
+    elif args.model_path:
         tokenizer_path = args.model_path
+        tokenizer = get_tokenizer(tokenizer_path, tokenizer_type="bpe", use_fast=True)
     else:
         tokenizer_path = args.output_dir
-
-    tokenizer = get_tokenizer(tokenizer_path, tokenizer_type="bpe", use_fast=True)
+        tokenizer = get_tokenizer(tokenizer_path, tokenizer_type="bpe", use_fast=True)
 
     # 创建数据集
-    logger.info(f"Loading training data from {args.train_file}")
-    train_dataset = FinetuneDataset(
-        data_path=args.train_file,
-        tokenizer=tokenizer,
-        max_seq_length=args.max_seq_length,
-        template=args.template,
-    )
-
-    eval_dataset = None
-    if args.validation_file:
-        logger.info(f"Loading validation data from {args.validation_file}")
-        eval_dataset = FinetuneDataset(
-            data_path=args.validation_file,
-            tokenizer=tokenizer,
-            max_seq_length=args.max_seq_length,
-            template=args.template,
+    if args.preprocessed_data:
+        # 预处理数据模式：使用 ShardedPreprocessedDataset
+        logger.info(f"Loading preprocessed SFT data from {args.preprocessed_data}")
+        train_dataset = ShardedPreprocessedDataset(
+            data_dir=args.preprocessed_data,
+            prefix="sft_train",
         )
+        # 检查是否有验证数据
+        eval_dataset = None
+        val_shards = [f for f in os.listdir(args.preprocessed_data)
+                      if f.startswith("sft_val_") and f.endswith(".pt")]
+        if val_shards:
+            eval_dataset = ShardedPreprocessedDataset(
+                data_dir=args.preprocessed_data,
+                prefix="sft_val",
+            )
+            logger.info(f"Validation samples: {len(eval_dataset)}")
+    else:
+        # 原始数据模式
+        if not args.train_file:
+            raise ValueError("Either --train_file or --preprocessed_data must be provided")
+
+        logger.info(f"Loading training data from {args.train_file}")
+        if args.train_file.endswith(".jsonl"):
+            train_dataset = ShardedFinetuneDataset(
+                data_path=args.train_file,
+                tokenizer=tokenizer,
+                max_seq_length=args.max_seq_length,
+                template=args.template,
+            )
+        else:
+            train_dataset = FinetuneDataset(
+                data_path=args.train_file,
+                tokenizer=tokenizer,
+                max_seq_length=args.max_seq_length,
+                template=args.template,
+            )
+
+        eval_dataset = None
+        if args.validation_file:
+            logger.info(f"Loading validation data from {args.validation_file}")
+            if args.validation_file.endswith(".jsonl"):
+                eval_dataset = ShardedFinetuneDataset(
+                    data_path=args.validation_file,
+                    tokenizer=tokenizer,
+                    max_seq_length=args.max_seq_length,
+                    template=args.template,
+                )
+            else:
+                eval_dataset = FinetuneDataset(
+                    data_path=args.validation_file,
+                    tokenizer=tokenizer,
+                    max_seq_length=args.max_seq_length,
+                    template=args.template,
+                )
 
     logger.info(f"Training samples: {len(train_dataset)}")
     if eval_dataset:
@@ -317,9 +395,12 @@ def main():
         logging_dir=args.logging_dir,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
         save_total_limit=args.save_total_limit,
         seed=args.seed,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_threshold=args.early_stopping_threshold,
     )
 
     # 创建训练器
@@ -330,6 +411,7 @@ def main():
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         collate_fn=collate_fn,
+        logger=logger,
     )
 
     # 记录超参数

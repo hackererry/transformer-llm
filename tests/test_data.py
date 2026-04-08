@@ -18,6 +18,7 @@ from src.data import (
     PretrainDataset,
     PretrainIterableDataset,
     FinetuneDataset,
+    ShardedFinetuneDataset,
     TextFileDataset,
     MemoryMappedDataset,
     create_dataset,
@@ -407,6 +408,183 @@ class TestShardedPreprocessedDataset:
 
             assert count == 1
 
+    def test_manifest_based_len(self):
+        """测试 manifest-based __len__ 不需要加载分片"""
+        examples = [
+            {"input_ids": list(range(10)), "labels": list(range(10))},
+            {"input_ids": list(range(20)), "labels": list(range(20))},
+        ]
+        metadata = {
+            "max_seq_length": 20,
+            "vocab_size": 32000,
+            "num_examples": 2,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 保存分片
+            for i in range(3):
+                shard_examples = [
+                    {"input_ids": list(range(10)), "labels": list(range(10))}
+                    for _ in range(5)
+                ]
+                save_preprocessed_data(
+                    shard_examples,
+                    os.path.join(tmpdir, f"train_{i:03d}.pt"),
+                    metadata,
+                )
+
+            # 创建 manifest
+            manifest = {
+                "version": "3.0",
+                "summary": {},
+                "shards": {
+                    "train_000.pt": {"num_examples": 5},
+                    "train_001.pt": {"num_examples": 5},
+                    "train_002.pt": {"num_examples": 5},
+                },
+            }
+            with open(os.path.join(tmpdir, "dataset_info.json"), "w") as f:
+                json.dump(manifest, f)
+
+            dataset = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                preload=False,
+            )
+
+            # __len__ 应返回 manifest 中的数量，不加载分片
+            assert len(dataset) == 15
+
+    def test_two_level_shuffle(self):
+        """测试两级 shuffle（分片间 + 分片内）"""
+        examples = [{"input_ids": [i], "labels": [i]} for i in range(10)]
+        metadata = {
+            "max_seq_length": 1,
+            "vocab_size": 32000,
+            "num_examples": 10,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(2):
+                save_preprocessed_data(
+                    examples[i * 5:(i + 1) * 5],
+                    os.path.join(tmpdir, f"train_{i:03d}.pt"),
+                    metadata,
+                )
+
+            # shuffle=True
+            dataset = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                shuffle=True,
+                preload=False,
+            )
+
+            # 第一次迭代
+            items1 = list(dataset)
+            labels1 = [item["labels"][0] for item in items1]
+
+            # 第二次迭代（同一 epoch，顺序相同）
+            dataset2 = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                shuffle=True,
+                preload=False,
+            )
+            items2 = list(dataset2)
+            labels2 = [item["labels"][0] for item in items2]
+            assert labels1 == labels2
+
+            # 不同 epoch 应有不同顺序
+            dataset3 = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                shuffle=True,
+                preload=False,
+                seed=42,
+            )
+            dataset3.set_epoch(0)
+            items3 = list(dataset3)
+            labels3 = [item["labels"][0] for item in items3]
+
+            dataset4 = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                shuffle=True,
+                preload=False,
+                seed=42,
+            )
+            dataset4.set_epoch(1)
+            items4 = list(dataset4)
+            labels4 = [item["labels"][0] for item in items4]
+
+            # 不同 epoch 顺序应不同（概率上几乎必然）
+            assert labels3 != labels4
+
+    def test_set_epoch_changes_order(self):
+        """测试 set_epoch 改变顺序"""
+        examples = [{"input_ids": [i], "labels": [i]} for i in range(6)]
+        metadata = {"max_seq_length": 1, "vocab_size": 32000, "num_examples": 6}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_preprocessed_data(
+                examples,
+                os.path.join(tmpdir, "train_000.pt"),
+                metadata,
+            )
+
+            dataset = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                shuffle=True,
+                preload=False,
+                seed=123,
+            )
+
+            dataset.set_epoch(0)
+            order0 = [item["labels"][0] for item in dataset]
+
+            dataset.set_epoch(1)
+            order1 = [item["labels"][0] for item in dataset]
+
+            # 不同 epoch 应有不同顺序
+            assert order0 != order1
+
+    def test_lazy_mode_with_manifest(self):
+        """测试惰性模式 + manifest"""
+        examples = [{"input_ids": [i], "labels": [i]} for i in range(3)]
+        metadata = {"max_seq_length": 1, "vocab_size": 32000, "num_examples": 3}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(2):
+                save_preprocessed_data(
+                    examples,
+                    os.path.join(tmpdir, f"train_{i:03d}.pt"),
+                    metadata,
+                )
+
+            manifest = {
+                "version": "3.0",
+                "summary": {},
+                "shards": {
+                    "train_000.pt": {"num_examples": 3},
+                    "train_001.pt": {"num_examples": 3},
+                },
+            }
+            with open(os.path.join(tmpdir, "dataset_info.json"), "w") as f:
+                json.dump(manifest, f)
+
+            dataset = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                preload=False,
+                shuffle=False,
+            )
+
+            assert len(dataset) == 6
+            count = sum(1 for _ in dataset)
+            assert count == 6
+
 
 class TestCreateShardedDataset:
     """创建分片数据集工厂函数测试"""
@@ -428,6 +606,395 @@ class TestCreateShardedDataset:
                 prefix="train",
             )
             assert len(dataset) >= 1
+
+
+class TestShardedPreprocessedDatasetWithAttentionMask:
+    """分片预处理数据集 attention_mask 支持测试"""
+
+    def test_iter_with_attention_mask(self):
+        """测试迭代时返回 attention_mask"""
+        examples = [
+            {
+                "input_ids": [1, 2, 3],
+                "labels": [-100, -100, 3],
+                "attention_mask": [1, 1, 1],
+            },
+        ]
+        metadata = {"max_seq_length": 3, "vocab_size": 100, "num_examples": 1}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_preprocessed_data(
+                examples,
+                os.path.join(tmpdir, "train_000.pt"),
+                metadata,
+            )
+
+            dataset = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                preload=False,
+            )
+
+            items = list(dataset)
+            assert len(items) == 1
+            assert "attention_mask" in items[0]
+            assert items[0]["attention_mask"] == [1, 1, 1]
+
+    def test_iter_without_attention_mask(self):
+        """测试没有 attention_mask 时不返回该字段"""
+        examples = [
+            {"input_ids": [1, 2, 3], "labels": [1, 2, 3]},
+        ]
+        metadata = {"max_seq_length": 3, "vocab_size": 100, "num_examples": 1}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_preprocessed_data(
+                examples,
+                os.path.join(tmpdir, "train_000.pt"),
+                metadata,
+            )
+
+            dataset = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                preload=False,
+            )
+
+            items = list(dataset)
+            assert len(items) == 1
+            assert "attention_mask" not in items[0]
+            assert "input_ids" in items[0]
+            assert "labels" in items[0]
+
+    def test_preload_with_attention_mask(self):
+        """测试预加载模式返回 attention_mask"""
+        examples = [
+            {
+                "input_ids": [1, 2, 3],
+                "labels": [-100, 2, 3],
+                "attention_mask": [1, 1, 1],
+            },
+            {
+                "input_ids": [4, 5],
+                "labels": [-100, 5],
+                "attention_mask": [1, 1],
+            },
+        ]
+        metadata = {"max_seq_length": 3, "vocab_size": 100, "num_examples": 2}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_preprocessed_data(
+                examples,
+                os.path.join(tmpdir, "train_000.pt"),
+                metadata,
+            )
+
+            dataset = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="train",
+                preload=True,
+            )
+
+            items = list(dataset)
+            assert len(items) == 2
+            for item in items:
+                assert "attention_mask" in item
+
+    def test_sft_preprocessed_data_with_collator(self):
+        """测试 SFT 预处理数据与 DataCollatorForSFT 配合"""
+        examples = [
+            {
+                "input_ids": [1, 2, 3, 4, 5],
+                "labels": [-100, -100, 3, 4, 5],
+                "attention_mask": [1, 1, 1, 1, 1],
+            },
+            {
+                "input_ids": [6, 7, 8],
+                "labels": [-100, -100, 8],
+                "attention_mask": [1, 1, 1],
+            },
+        ]
+        metadata = {"max_seq_length": 5, "vocab_size": 100, "num_examples": 2}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_preprocessed_data(
+                examples,
+                os.path.join(tmpdir, "sft_train_000.pt"),
+                metadata,
+            )
+
+            dataset = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="sft_train",
+                preload=False,
+            )
+
+            items = list(dataset)
+            assert len(items) == 2
+
+            # 使用 SFT collator
+            collator = DataCollatorForSFT(pad_token_id=0)
+            batch = collator(items)
+
+            assert batch["input_ids"].shape == (2, 5)
+            assert batch["labels"].shape == (2, 5)
+            assert batch["attention_mask"].shape == (2, 5)
+            # 第二个样本 padding 位置的 labels 应为 -100
+            assert batch["labels"][1, 3].item() == -100
+            assert batch["labels"][1, 4].item() == -100
+            # 第二个样本 padding 位置的 attention_mask 应为 0
+            assert batch["attention_mask"][1, 3].item() == 0
+            assert batch["attention_mask"][1, 4].item() == 0
+
+
+class TestSFTPreprocessScript:
+    """SFT 数据预处理脚本测试"""
+
+    def test_format_prompt_alpaca(self):
+        """测试 alpaca 模板格式化"""
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from scripts.preprocess_sft_data import format_prompt
+
+        item = {"instruction": "What is 2+2?", "input": "", "output": "4"}
+        prompt, full_text = format_prompt(item, "alpaca")
+        assert "### Instruction:" in prompt
+        assert "### Response:" in prompt
+        assert full_text == prompt + "4"
+
+    def test_format_prompt_alpaca_with_input(self):
+        """测试 alpaca 模板带 input 字段"""
+        from scripts.preprocess_sft_data import format_prompt
+
+        item = {"instruction": "Translate", "input": "hello", "output": "你好"}
+        prompt, full_text = format_prompt(item, "alpaca")
+        assert "### Input:" in prompt
+        assert "hello" in prompt
+
+    def test_format_prompt_simple(self):
+        """测试 simple 模板"""
+        from scripts.preprocess_sft_data import format_prompt
+
+        item = {"instruction": "Hi", "input": "", "output": "Hello"}
+        prompt, full_text = format_prompt(item, "simple")
+        assert "Instruction:" in prompt
+        assert "Output:" in prompt
+
+    def test_load_sft_data_jsonl(self):
+        """测试加载 JSONL 数据"""
+        from scripts.preprocess_sft_data import load_sft_data
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jsonl_path = os.path.join(tmpdir, "test.jsonl")
+            with open(jsonl_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"instruction": "a", "output": "b"}) + "\n")
+                f.write(json.dumps({"instruction": "c", "output": "d"}) + "\n")
+
+            data = load_sft_data(jsonl_path)
+            assert len(data) == 2
+
+    def test_load_sft_data_json(self):
+        """测试加载 JSON 数据"""
+        from scripts.preprocess_sft_data import load_sft_data
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, "test.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump([{"instruction": "a", "output": "b"}], f)
+
+            data = load_sft_data(json_path)
+            assert len(data) == 1
+
+    def test_process_sft_data(self):
+        """测试 SFT 数据处理"""
+        from scripts.preprocess_sft_data import process_sft_data
+
+        tokenizer = HuggingFaceBPETokenizer()
+        tokenizer.train(["hello world test instruction output"], vocab_size=50, min_frequency=1)
+
+        data = [
+            {"instruction": "What is 2+2?", "input": "", "output": "4"},
+            {"instruction": "Hello", "input": "world", "output": "test"},
+        ]
+
+        examples = process_sft_data(data, tokenizer, max_seq_length=512, template="alpaca")
+
+        assert len(examples) == 2
+        for ex in examples:
+            assert "input_ids" in ex
+            assert "labels" in ex
+            assert "attention_mask" in ex
+            assert len(ex["input_ids"]) == len(ex["labels"])
+            assert len(ex["input_ids"]) == len(ex["attention_mask"])
+            # prompt 部分应有 -100
+            assert -100 in ex["labels"]
+
+    def test_end_to_end_preprocess(self):
+        """测试端到端预处理流程"""
+        from scripts.preprocess_sft_data import (
+            load_sft_data, process_sft_data, save_shards
+        )
+
+        tokenizer = HuggingFaceBPETokenizer()
+        tokenizer.train(["hello world test instruction output"], vocab_size=50, min_frequency=1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 创建测试数据
+            jsonl_path = os.path.join(tmpdir, "train.jsonl")
+            with open(jsonl_path, "w", encoding="utf-8") as f:
+                for i in range(5):
+                    f.write(json.dumps({
+                        "instruction": f"Test instruction {i}",
+                        "input": f"Input {i}",
+                        "output": f"Output {i}",
+                    }) + "\n")
+
+            # 处理
+            data = load_sft_data(jsonl_path)
+            examples = process_sft_data(data, tokenizer, max_seq_length=512, template="alpaca")
+
+            metadata = {
+                "max_seq_length": 512,
+                "vocab_size": tokenizer.vocab_size,
+                "template": "alpaca",
+            }
+
+            shard_files = save_shards(examples, tmpdir, "sft_train", shard_size=3, metadata=metadata)
+
+            assert len(shard_files) == 2  # 5 examples / 3 per shard = 2 shards
+
+            # 验证可以通过 ShardedPreprocessedDataset 加载
+            dataset = ShardedPreprocessedDataset(
+                data_dir=tmpdir,
+                prefix="sft_train",
+                preload=False,
+            )
+
+            items = list(dataset)
+            assert len(items) == 5
+            for item in items:
+                assert "input_ids" in item
+                assert "labels" in item
+                assert "attention_mask" in item
+
+
+class TestShardedFinetuneDataset:
+    """ShardedFinetuneDataset 测试"""
+
+    def test_jsonl_lazy_loading(self):
+        """测试 JSONL 文件的惰性加载"""
+        tokenizer = HuggingFaceBPETokenizer()
+        tokenizer.train(["hello world test"], vocab_size=50, min_frequency=1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jsonl_path = os.path.join(tmpdir, "train.jsonl")
+            with open(jsonl_path, "w", encoding="utf-8") as f:
+                for i in range(5):
+                    f.write(json.dumps({
+                        "instruction": f"Test instruction {i}",
+                        "input": f"Input {i}",
+                        "output": f"Output {i}",
+                    }) + "\n")
+
+            dataset = ShardedFinetuneDataset(
+                data_path=jsonl_path,
+                tokenizer=tokenizer,
+                max_seq_length=512,
+                template="alpaca",
+            )
+
+            try:
+                assert len(dataset) == 5
+
+                # 获取一个样本
+                item = dataset[0]
+                assert "input_ids" in item
+                assert "labels" in item
+                assert "attention_mask" in item
+                assert item["input_ids"].dtype == torch.long
+            finally:
+                dataset._mmap.close()
+                dataset._file.close()
+
+    def test_mmap_indexing(self):
+        """测试 mmap 索引正确性"""
+        tokenizer = HuggingFaceBPETokenizer()
+        tokenizer.train(["test data"], vocab_size=50, min_frequency=1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jsonl_path = os.path.join(tmpdir, "train.jsonl")
+            for i in range(3):
+                line = json.dumps({
+                    "instruction": f"Instr {i}",
+                    "input": f"Inp {i}",
+                    "output": f"Out {i}",
+                })
+                with open(jsonl_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+
+            dataset = ShardedFinetuneDataset(
+                data_path=jsonl_path,
+                tokenizer=tokenizer,
+                max_seq_length=512,
+                template="alpaca",
+            )
+
+            try:
+                assert len(dataset) == 3
+
+                # 所有样本都能正确读取
+                for i in range(3):
+                    item = dataset[i]
+                    assert "input_ids" in item
+                    assert item["input_ids"].shape[0] > 0
+            finally:
+                dataset._mmap.close()
+                dataset._file.close()
+
+    def test_labels_masking(self):
+        """测试 prompt 部分标签为 -100"""
+        tokenizer = HuggingFaceBPETokenizer()
+        tokenizer.train(["hello world test data"], vocab_size=50, min_frequency=1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jsonl_path = os.path.join(tmpdir, "train.jsonl")
+            with open(jsonl_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "instruction": "What is 2+2?",
+                    "input": "",
+                    "output": "4",
+                }) + "\n")
+
+            dataset = ShardedFinetuneDataset(
+                data_path=jsonl_path,
+                tokenizer=tokenizer,
+                max_seq_length=512,
+                template="alpaca",
+            )
+
+            try:
+                item = dataset[0]
+                labels = item["labels"]
+
+                # prompt 部分应为 -100
+                assert -100 in labels.tolist()
+            finally:
+                dataset._mmap.close()
+                dataset._file.close()
+
+    def test_requires_jsonl(self):
+        """测试只接受 .jsonl 格式"""
+        tokenizer = HuggingFaceBPETokenizer()
+        tokenizer.train(["test"], vocab_size=50, min_frequency=1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, "train.json")
+
+            with pytest.raises(ValueError, match="requires .jsonl"):
+                ShardedFinetuneDataset(
+                    data_path=json_path,
+                    tokenizer=tokenizer,
+                    max_seq_length=512,
+                )
 
 
 # ============ 增量预处理测试 ============
@@ -505,7 +1072,6 @@ class TestDetectFileChanges:
                     "deleted.txt": {
                         "hash": "abc123",
                         "status": "processed",
-                        "full_path": "/path/to/deleted.txt",
                     }
                 },
             }
@@ -645,7 +1211,6 @@ class TestIncrementalAddNewFiles:
                 "summary": {
                     "total_files": 0,
                     "total_shards": 0,
-                    "total_examples": 0,
                     "next_shard_index": 0,
                 },
             }
@@ -654,7 +1219,7 @@ class TestIncrementalAddNewFiles:
 
             config = PreprocessConfig(
                 train_files=[new_file],
-                validation_file=None,
+                validation_files=[],
                 output_dir=tmpdir,
                 max_seq_length=10,
                 vocab_size=50,
@@ -684,7 +1249,7 @@ class TestHandleDeletedFiles:
                 }
             },
             "shards": {
-                "train_000.pt": {"index": 0, "source_files": ["deleted.txt"]}
+                "train_000.pt": {"num_examples": 100}
             },
             "summary": {
                 "total_files": 1,
@@ -725,7 +1290,7 @@ class TestTokenizerPolicy:
 
             config = PreprocessConfig(
                 train_files=[],
-                validation_file=None,
+                validation_files=[],
                 output_dir=tmpdir,
                 tokenizer_mode="frozen",
             )

@@ -11,6 +11,7 @@ from .clean_text import (
 
 from .document_converter import (
     convert_to_txt,
+    convert_parquet_to_txt,
     epub_to_txt,
     batch_convert,
     merge_txt_files,
@@ -18,6 +19,7 @@ from .document_converter import (
     PDFExtractor,
     CSVExtractor,
     JSONExtractor,
+    ParquetExtractor,
 )
 
 from .deduplicate import (
@@ -54,6 +56,7 @@ __all__ = [
     "batch_clean_directory",
     # 文档转换
     "convert_to_txt",
+    "convert_parquet_to_txt",
     "epub_to_txt",
     "batch_convert",
     "merge_txt_files",
@@ -61,6 +64,7 @@ __all__ = [
     "PDFExtractor",
     "CSVExtractor",
     "JSONExtractor",
+    "ParquetExtractor",
     # 去重
     "exact_deduplicate",
     "near_deduplicate",

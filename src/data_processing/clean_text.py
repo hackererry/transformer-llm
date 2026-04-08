@@ -4,7 +4,6 @@
 """
 import re
 import os
-import argparse
 from typing import List, Optional
 
 
@@ -71,6 +70,30 @@ class TextCleaner:
         text = re.sub(r'\.{3,}', '...', text)  # 省略号
         text = re.sub(r'-{2,}', '——', text)   # 破折号
 
+        return text
+
+    @staticmethod
+    def remove_wechat_tags(text: str) -> str:
+        """移除微信公众号提取残留的 <WECHAT> 标签
+
+        数据来源为微信公众号文章时，英文/特殊字符会被替换为 <WECHAT>。
+        这些标签几乎都出现在括号内的英文原文注释中，如：
+          弗朗西斯·赫斯特（<WECHAT> <WECHAT> Hirst）
+          《经济学人》（The <WECHAT>）
+        策略：删除包含 <WECHAT> 的整个括号内容（中文已有翻译，英文残片无价值），
+        然后清除残留的独立标签。
+        """
+        # 1) 移除包含 <WECHAT> 的中文括号及内容
+        text = re.sub(r'（[^）]*<WECHAT>[^）]*）', '', text)
+        # 2) 移除包含 <WECHAT> 的英文括号及内容
+        text = re.sub(r'\([^)]*<WECHAT>[^)]*\)', '', text)
+        # 3) 移除残留的独立 <WECHAT> 标签
+        text = re.sub(r'<WECHAT>', '', text)
+        # 4) 清理括号移除后产生的多余空格
+        text = re.sub(r'[ \t]+', ' ', text)
+        # 5) 清理因移除括号变为空的括号
+        text = re.sub(r'（\s*）', '', text)
+        text = re.sub(r'\(\s*\)', '', text)
         return text
 
     @staticmethod
@@ -424,60 +447,3 @@ def batch_clean_directory(
             print(f"  - {f}")
 
     return success_files
-
-
-def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description="文本清洗工具")
-
-    subparsers = parser.add_subparsers(dest="command", help="命令")
-
-    # clean 命令
-    clean_parser = subparsers.add_parser("clean", help="清洗文本文件")
-    clean_parser.add_argument("input", nargs="?", help="输入文件路径（与 -d 互斥）")
-    clean_parser.add_argument("-o", "--output", help="输出文件路径")
-    clean_parser.add_argument("-d", "--dir", help="批量清洗的输入目录")
-    clean_parser.add_argument("--remove-urls", action="store_true", help="移除URL")
-    clean_parser.add_argument("--remove-emails", action="store_true", help="移除邮箱")
-
-    # split 命令
-    split_parser = subparsers.add_parser("split", help="分割大文件")
-    split_parser.add_argument("input", help="输入文件路径")
-    split_parser.add_argument("-o", "--output-dir", required=True, help="输出目录")
-    split_parser.add_argument("--max-chars", type=int, default=1000000, help="每文件最大字符数")
-    split_parser.add_argument("--overlap", type=int, default=1000, help="文件间重叠字符数")
-
-    args = parser.parse_args()
-
-    if args.command == "clean":
-        if args.dir:
-            # 批量清洗模式
-            batch_clean_directory(
-                args.dir,
-                args.output,
-                remove_urls=args.remove_urls,
-                remove_emails=args.remove_emails,
-            )
-        elif args.input:
-            # 单文件清洗模式
-            clean_file(
-                args.input,
-                args.output,
-                remove_urls=args.remove_urls,
-                remove_emails=args.remove_emails,
-            )
-        else:
-            clean_parser.print_help()
-    elif args.command == "split":
-        split_large_file(
-            args.input,
-            args.output_dir,
-            args.max_chars,
-            args.overlap,
-        )
-    else:
-        parser.print_help()
-
-
-if __name__ == "__main__":
-    main()

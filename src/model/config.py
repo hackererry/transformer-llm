@@ -35,7 +35,7 @@ class ModelConfig:
 
     # 其他配置
     use_cache: bool = True  # 是否使用KV缓存(推理时)
-    tie_word_embeddings: bool = False  # 是否共享输入输出嵌入
+    tie_word_embeddings: bool = True  # 是否共享输入输出嵌入
 
     # 梯度检查点
     gradient_checkpointing: bool = False  # 是否启用梯度检查点
@@ -113,6 +113,20 @@ class ModelConfig:
             max_position_embeddings=1024,
             use_moe=False,  # 小模型禁用 MoE
             use_mla=True,   # MLA 几乎零开销
+        )
+
+    @classmethod
+    def base(cls) -> "ModelConfig":
+        """Base配置: ~144M参数，针对RTX 4060 Ti (8GB)优化"""
+        return cls(
+            vocab_size=32000,
+            hidden_size=768,
+            num_hidden_layers=16,
+            num_attention_heads=12,
+            intermediate_size=2048,
+            max_position_embeddings=2048,
+            use_moe=False,
+            use_mla=True,
         )
 
     @classmethod

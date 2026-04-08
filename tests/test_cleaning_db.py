@@ -411,6 +411,113 @@ class TestStats:
         assert stats["total_pii"] == 15
 
 
+class TestGetAllProcessedMd5s:
+    """get_all_processed_md5s 测试类"""
+
+    def test_empty_db(self, temp_db):
+        """测试空数据库返回空集合"""
+        result = temp_db.get_all_processed_md5s()
+        assert result == set()
+
+    def test_returns_all_md5s(self, temp_db, sample_doc_data):
+        """测试返回所有已处理文档的 MD5"""
+        md5s = []
+        for i in range(3):
+            doc = sample_doc_data.copy()
+            doc["original_file_path"] = f"/path/to/test_{i}.txt"
+            doc["original_md5"] = f"md5_{i}"
+            doc["cleaned_md5"] = f"cleaned_md5_{i}"
+            doc["cleaned_content"] = f"内容 {i}"
+            temp_db.save_cleaned_document(doc)
+            md5s.append(f"md5_{i}")
+
+        result = temp_db.get_all_processed_md5s()
+        assert result == set(md5s)
+
+    def test_excludes_empty_md5s(self, temp_db, sample_doc_data):
+        """测试排除空 MD5"""
+        # 保存一个有空 MD5 的文档
+        doc = sample_doc_data.copy()
+        doc["original_md5"] = ""
+        temp_db.save_cleaned_document(doc)
+
+        # 保存一个有正常 MD5 的文档
+        doc2 = sample_doc_data.copy()
+        doc2["original_file_path"] = "/path/to/test2.txt"
+        doc2["original_md5"] = "valid_md5"
+        doc2["cleaned_md5"] = "cleaned_valid"
+        doc2["cleaned_content"] = "内容"
+        temp_db.save_cleaned_document(doc2)
+
+        result = temp_db.get_all_processed_md5s()
+        assert result == {"valid_md5"}
+
+
+class TestPipelineSkip:
+    """stream_clean_pipeline 跳过行为测试"""
+
+    def test_skip_already_processed(self, temp_db):
+        """测试已处理文件被跳过"""
+        from src.data_processing.pipeline import stream_clean_pipeline
+        import tempfile
+
+        # 创建一个临时输入文件
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as f:
+            f.write("这是一些测试文本内容\n第二行内容\n")
+            input_path = f.name
+
+        try:
+            # 第一次运行：正常处理并写入数据库
+            stats1 = stream_clean_pipeline(
+                input_path=input_path,
+                output_path=None,
+                db=temp_db,
+                show_progress=False,
+            )
+            assert not stats1.get("skipped", False)
+            assert stats1["output_lines"] > 0
+
+            # 第二次运行：应该跳过
+            stats2 = stream_clean_pipeline(
+                input_path=input_path,
+                output_path=None,
+                db=temp_db,
+                show_progress=False,
+            )
+            assert stats2.get("skipped") is True
+
+            # 验证数据库中只有一条记录
+            assert temp_db.get_document_count() == 1
+        finally:
+            os.unlink(input_path)
+
+    def test_no_db_no_skip(self, temp_db):
+        """测试没有数据库时不跳过"""
+        from src.data_processing.pipeline import stream_clean_pipeline
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as f:
+            f.write("测试文本\n")
+            input_path = f.name
+
+        try:
+            # 无数据库，不应跳过
+            stats = stream_clean_pipeline(
+                input_path=input_path,
+                output_path=None,
+                db=None,
+                show_progress=False,
+            )
+            assert not stats.get("skipped", False)
+            assert stats["output_lines"] > 0
+        finally:
+            os.unlink(input_path)
+
+
 class TestCreateCleaningDb:
     """create_cleaning_db 函数测试"""
 

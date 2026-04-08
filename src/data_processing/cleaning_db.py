@@ -161,6 +161,10 @@ class LegacyCleaningDatabase:
         """检查文档是否已处理"""
         return self._doc_repo.is_processed(original_md5)
 
+    def get_all_processed_md5s(self) -> set:
+        """获取所有已处理文档的 original_md5 集合"""
+        return self._doc_repo.get_all_processed_md5s()
+
     def is_path_processed(self, file_path: str) -> bool:
         """检查文件路径是否已处理"""
         return self._doc_repo.find_by_original_path(file_path) is not None

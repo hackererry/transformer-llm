@@ -5,6 +5,7 @@
 import os
 import time
 import signal
+import logging
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, IterableDataset
@@ -18,6 +19,7 @@ from contextlib import contextmanager
 from .optimizer import create_optimizer
 from .scheduler import create_scheduler
 from .checkpoint import CheckpointManager, save_model
+from src.utils.logging import Logger
 
 
 @dataclass
@@ -57,6 +59,10 @@ class TrainingConfig:
     save_steps: int = 500
     save_total_limit: int = 3
     eval_steps: int = 500
+
+    # Early stopping
+    early_stopping_patience: int = 0       # 0 = 不启用, >0 = 容忍的连续未改善评估次数
+    early_stopping_threshold: float = 0.0  # 最小改善阈值（绝对值），loss 改善小于此值不算改善
 
     # 其他
     seed: int = 42
@@ -156,9 +162,10 @@ class PerformanceMonitor:
                     print(f"  {stage_name:<18}: {pct:>6.2f}%  ({stats['total']:.3f}s)")
         print("=" * 70 + "\n")
 
-    def log_step(self, step: int, global_step: int, loss: float, lr: float):
-        if not self.enabled or self.step_count == 0:
-            return
+    def log_step(self, step: int, global_step: int, loss: float, lr: float) -> Dict[str, float]:
+        """获取最近一步的性能计时数据（不打印，由调用方决定输出方式）"""
+        if not self.enabled:
+            return {}
         summary = self.get_summary()
         recent = {
             "data_loading": summary["data_loading"]["mean"] if summary["data_loading"]["count"] > 0 else 0,
@@ -166,11 +173,7 @@ class PerformanceMonitor:
             "backward": summary["backward"]["mean"] if summary["backward"]["count"] > 0 else 0,
             "batch": summary["batch_total"]["mean"] if summary["batch_total"]["count"] > 0 else 0,
         }
-        print(f"[Step {global_step}] Loss: {loss:.4f} | LR: {lr:.2e} | "
-              f"Data: {recent['data_loading']*1000:.1f}ms | "
-              f"Fwd: {recent['forward']*1000:.1f}ms | "
-              f"Bwd: {recent['backward']*1000:.1f}ms | "
-              f"Total: {recent['batch']*1000:.1f}ms")
+        return recent
 
 
 class TrainingInterrupted(Exception):
@@ -192,6 +195,7 @@ class Trainer:
         eval_dataset: Optional[Dataset] = None,
         tokenizer=None,
         collate_fn: Optional[Callable] = None,
+        logger: Optional[Logger] = None,
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -199,6 +203,7 @@ class Trainer:
         self.tokenizer = tokenizer
         self.collate_fn = collate_fn
         self.config = config
+        self._logger = logger
 
         # 自动设备检测
         self.device = self._setup_device()
@@ -231,19 +236,76 @@ class Trainer:
         # 初始化
         self._setup()
 
+    def _print(self, msg: str):
+        """统一输出：有 logger 走 logger，无 logger 走 print"""
+        if self._logger:
+            self._logger.info(msg)
+        else:
+            print(msg)
+
+    def _file_only_info(self, msg: str):
+        """仅写入文件日志（不输出到控制台，避免打断 tqdm）"""
+        if self._logger:
+            for handler in self._logger.logger.handlers:
+                if isinstance(handler, logging.FileHandler):
+                    record = logging.LogRecord(
+                        name=self._logger.logger.name,
+                        level=logging.INFO,
+                        pathname="",
+                        lineno=0,
+                        msg=msg,
+                        args=(),
+                        exc_info=None,
+                    )
+                    handler.emit(record)
+
+    def _log_step_to_file(self, metrics: Dict[str, Any], step: int):
+        """将步级指标写入文件日志（不输出到控制台，避免打断 tqdm）"""
+        if self._logger:
+            metric_strs = []
+            for key, value in metrics.items():
+                if isinstance(value, float):
+                    metric_strs.append(f"{key}={value:.6f}")
+                else:
+                    metric_strs.append(f"{key}={value}")
+            msg = f"Step {step}: {', '.join(metric_strs)}"
+
+            # 仅写入文件 handler
+            for handler in self._logger.logger.handlers:
+                if isinstance(handler, logging.FileHandler):
+                    record = logging.LogRecord(
+                        name=self._logger.logger.name,
+                        level=logging.INFO,
+                        pathname="",
+                        lineno=0,
+                        msg=msg,
+                        args=(),
+                        exc_info=None,
+                    )
+                    handler.emit(record)
+
+            # 存入指标历史
+            self._logger.metrics_history.append({
+                "step": step,
+                "timestamp": time.time() - self._logger.start_time,
+                **metrics,
+            })
+        else:
+            self._log(metrics)
+
     def _setup_device(self) -> torch.device:
         """设置设备并打印信息"""
         if torch.cuda.is_available():
             device = torch.device("cuda")
             gpu_name = torch.cuda.get_device_name(0)
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            print(f"\n{'='*60}")
-            print(f"  GPU Training Mode")
-            print(f"{'='*60}")
-            print(f"  Device: {gpu_name}")
-            print(f"  Total Memory: {gpu_memory:.1f} GB")
-            print(f"  Precision: {'BF16' if self.config.bf16 else 'FP16' if self.config.fp16 else 'FP32'}")
-            print(f"{'='*60}\n")
+            self._print(f"\n{'='*60}")
+            self._print(f"  GPU Training Mode")
+            self._print(f"{'='*60}")
+            self._print(f"  Device: {gpu_name}")
+            self._print(f"  Total Memory: {gpu_memory:.1f} GB")
+            self._print(f"  Precision: {'BF16' if self.config.bf16 else 'FP16' if self.config.fp16 else 'FP32'}")
+            self._print(f"{'='*60}\n")
 
             # 启用TF32 for Ampere+
             capability = torch.cuda.get_device_capability()
@@ -252,11 +314,11 @@ class Trainer:
                 torch.backends.cudnn.allow_tf32 = True
         else:
             device = torch.device("cpu")
-            print(f"\n{'='*60}")
-            print(f"  CPU Training Mode")
-            print(f"{'='*60}")
-            print(f"  Device: CPU")
-            print(f"{'='*60}\n")
+            self._print(f"\n{'='*60}")
+            self._print(f"  CPU Training Mode")
+            self._print(f"{'='*60}")
+            self._print(f"  Device: CPU")
+            self._print(f"{'='*60}\n")
 
         return device
 
@@ -272,6 +334,15 @@ class Trainer:
             shuffle=True,
         )
 
+        # 打印数据加载模式
+        if isinstance(self.train_dataset, IterableDataset):
+            if hasattr(self.train_dataset, 'preload') and not self.train_dataset.preload:
+                self._print(f"  Data loading: lazy mode (shard-by-shard with prefetch)")
+            else:
+                self._print(f"  Data loading: iterable dataset")
+        else:
+            self._print(f"  Data loading: map-style dataset")
+
         if self.eval_dataset is not None:
             self.eval_dataloader = self._create_dataloader(
                 self.eval_dataset,
@@ -286,8 +357,14 @@ class Trainer:
             weight_decay=self.config.weight_decay,
         )
 
-        # 计算训练步数
-        num_training_steps = len(self.train_dataloader) * self.config.num_train_epochs
+        # 计算训练步数（优化器步数 = 批次数 / 梯度累积步数）
+        if hasattr(self.train_dataset, '__len__'):
+            num_samples = len(self.train_dataset)
+            batch_size = self.config.per_device_train_batch_size
+            num_batches_per_epoch = num_samples // batch_size if self.config.dataloader_drop_last else math.ceil(num_samples / batch_size)
+            num_training_steps = (num_batches_per_epoch // self.config.gradient_accumulation_steps) * self.config.num_train_epochs
+        else:
+            num_training_steps = self.config.max_steps if self.config.max_steps > 0 else 1000
         if self.config.max_steps > 0:
             num_training_steps = min(num_training_steps, self.config.max_steps)
 
@@ -336,9 +413,9 @@ class Trainer:
     def _setup_signal_handlers(self):
         """设置信号处理器，支持手动终止"""
         def signal_handler(signum, frame):
-            print("\n" + "=" * 50)
-            print("Received interrupt signal! Will save model after current step...")
-            print("=" * 50)
+            self._print("\n" + "=" * 50)
+            self._print("Received interrupt signal! Will save model after current step...")
+            self._print("=" * 50)
             self.interrupted = True
 
         signal.signal(signal.SIGINT, signal_handler)
@@ -346,11 +423,24 @@ class Trainer:
             signal.signal(signal.SIGBREAK, signal_handler)
 
     def _log(self, metrics: Dict[str, float]):
-        """记录日志"""
+        """记录日志（无 logger 时的简单回退）"""
         log_file = os.path.join(self.config.logging_dir, "training_log.txt")
         with open(log_file, "a") as f:
             log_line = " | ".join([f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()])
             f.write(f"{log_line}\n")
+
+    def _log_perf_summary_to_file(self, epoch: int):
+        """将性能摘要写入文件日志"""
+        if not self._logger:
+            return
+        summary = self.perf_monitor.get_summary()
+        self._file_only_info(f"Epoch {epoch + 1} Performance Summary:")
+        for stage, stats in summary.items():
+            if stats["count"] > 0:
+                stage_name = stage.replace("_", " ").title()
+                msg = (f"  {stage_name}: count={stats['count']}, "
+                       f"total={stats['total']:.3f}s, mean={stats['mean']*1000:.2f}ms")
+                self._file_only_info(msg)
 
     def train(self) -> Dict[str, Any]:
         """执行训练"""
@@ -371,28 +461,59 @@ class Trainer:
             start_step = state.get("step", 0)
             self.global_step = start_step
 
-        total_training_steps = len(self.train_dataloader) * self.config.num_train_epochs
+        total_training_steps = 0
+        if hasattr(self.train_dataset, '__len__'):
+            num_samples = len(self.train_dataset)
+            batch_size = self.config.per_device_train_batch_size
+            num_batches_per_epoch = num_samples // batch_size if self.config.dataloader_drop_last else math.ceil(num_samples / batch_size)
+            total_training_steps = (num_batches_per_epoch // self.config.gradient_accumulation_steps) * self.config.num_train_epochs
         if self.config.max_steps > 0:
-            total_training_steps = min(total_training_steps, self.config.max_steps)
+            total_training_steps = min(total_training_steps, self.config.max_steps) if total_training_steps > 0 else self.config.max_steps
 
-        print(f"Starting training from epoch {start_epoch}, step {start_step}")
-        print(f"Total training steps: {total_training_steps}")
+        self._print(f"Starting training from epoch {start_epoch}, step {start_step}")
+        self._print(f"Total training steps: {total_training_steps}")
 
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=self.device)
         best_eval_loss = float("inf")
+        early_stopping_counter = 0
+        early_stopped = False
         avg_epoch_loss = 0.0
         start_time = time.time()
 
         try:
             for epoch in range(start_epoch, self.config.num_train_epochs):
+                # 通知数据集当前 epoch（用于 shuffle 变化）
+                if hasattr(self.train_dataset, 'set_epoch'):
+                    self.train_dataset.set_epoch(epoch)
+
+                # IterableDataset 需要重建 DataLoader 获取新的迭代器
+                if isinstance(self.train_dataset, IterableDataset) and epoch > start_epoch:
+                    self.train_dataloader = self._create_dataloader(
+                        self.train_dataset,
+                        self.config.per_device_train_batch_size,
+                        shuffle=False,
+                    )
+
                 self.model.train()
-                epoch_loss = 0.0
+                epoch_loss = torch.tensor(0.0, device=self.device)
                 epoch_steps = 0
                 self.perf_monitor.reset()
 
+                # 计算 dataloader 长度（批次数，而非样本数）
+                dataloader_len = None
+                if hasattr(self.train_dataset, '__len__'):
+                    num_samples = len(self.train_dataset)
+                    batch_size = self.config.per_device_train_batch_size
+                    dataloader_len = num_samples // batch_size if self.config.dataloader_drop_last else math.ceil(num_samples / batch_size)
+                else:
+                    try:
+                        dataloader_len = len(self.train_dataloader)
+                    except TypeError:
+                        pass
+
                 progress_bar = tqdm(
                     enumerate(self.train_dataloader),
-                    total=len(self.train_dataloader),
+                    total=dataloader_len,
                     desc=f"Epoch {epoch + 1}/{self.config.num_train_epochs}",
                 )
 
@@ -401,7 +522,7 @@ class Trainer:
                         break
 
                     # 跳过已训练的步
-                    if epoch == start_epoch and step < start_step % len(self.train_dataloader):
+                    if epoch == start_epoch and dataloader_len and step < start_step % dataloader_len:
                         continue
 
                     batch_start_time = time.perf_counter()
@@ -428,8 +549,8 @@ class Trainer:
                         else:
                             loss.backward()
 
-                    total_loss += loss.item()
-                    epoch_loss += loss.item()
+                    total_loss += loss.detach()
+                    epoch_loss += loss.detach()
 
                     # 梯度累积
                     if (step + 1) % self.config.gradient_accumulation_steps == 0:
@@ -463,12 +584,37 @@ class Trainer:
 
                         # 日志
                         if self.global_step % self.config.logging_steps == 0:
-                            avg_loss = total_loss / self.config.logging_steps
+                            avg_loss = total_loss.item() / self.config.logging_steps
                             lr = self.optimizer.param_groups[0]["lr"]
-                            progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
-                            self.perf_monitor.log_step(step, self.global_step, avg_loss, lr)
-                            self._log({"loss": avg_loss, "learning_rate": lr, "step": self.global_step})
-                            total_loss = 0.0
+
+                            # 获取性能计时数据
+                            perf_data = self.perf_monitor.log_step(step, self.global_step, avg_loss, lr)
+                            step_time_ms = perf_data.get("batch", 0) * 1000
+
+                            # 更新 tqdm postfix（不打印到控制台）
+                            if step_time_ms > 0:
+                                progress_bar.set_postfix(
+                                    loss=f"{avg_loss:.4f}",
+                                    lr=f"{lr:.2e}",
+                                    speed=f"{step_time_ms:.0f}ms/step",
+                                )
+                            else:
+                                progress_bar.set_postfix(
+                                    loss=f"{avg_loss:.4f}",
+                                    lr=f"{lr:.2e}",
+                                )
+
+                            # 写入文件日志（含完整指标）
+                            self._log_step_to_file({
+                                "loss": avg_loss,
+                                "learning_rate": lr,
+                                "epoch": epoch + 1,
+                                "data_ms": perf_data.get("data_loading", 0) * 1000,
+                                "forward_ms": perf_data.get("forward", 0) * 1000,
+                                "backward_ms": perf_data.get("backward", 0) * 1000,
+                                "step_ms": step_time_ms,
+                            }, self.global_step)
+                            total_loss = torch.tensor(0.0, device=self.device)
 
                         # 保存检查点
                         if self.global_step % self.config.save_steps == 0:
@@ -477,31 +623,60 @@ class Trainer:
                         # 评估
                         if self.eval_dataset is not None and self.global_step % self.config.eval_steps == 0:
                             eval_results = self.evaluate()
+
+                            # Early stopping 逻辑
+                            if self.config.early_stopping_patience > 0:
+                                improvement = best_eval_loss - eval_results["loss"]
+                                if improvement > self.config.early_stopping_threshold:
+                                    early_stopping_counter = 0
+                                else:
+                                    early_stopping_counter += 1
+                                    self._print(f"EarlyStopping counter: {early_stopping_counter}/{self.config.early_stopping_patience}")
+
+                            # 更新最佳 eval loss 并保存
                             if eval_results["loss"] < best_eval_loss:
                                 best_eval_loss = eval_results["loss"]
                                 self._save_checkpoint(epoch, self.global_step, is_best=True)
+
+                            # 检查是否触发 early stopping
+                            if self.config.early_stopping_patience > 0 and early_stopping_counter >= self.config.early_stopping_patience:
+                                self._print(f"Early stopping triggered! No improvement for {self.config.early_stopping_patience} evaluations.")
+                                self.interrupted = True
+                                early_stopped = True
 
                         # 检查最大步数
                         if self.config.max_steps > 0 and self.global_step >= self.config.max_steps:
                             break
 
-                avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
-                print(f"Epoch {epoch + 1} average loss: {avg_epoch_loss:.4f}")
-                self.perf_monitor.print_summary()
+                avg_epoch_loss = epoch_loss.item() / max(epoch_steps, 1)
+                self._print(f"Epoch {epoch + 1} average loss: {avg_epoch_loss:.4f}")
+
+                # 性能摘要写入文件（每个 epoch）
+                self._log_perf_summary_to_file(epoch)
+
+                # 判断是否为最后一个 epoch（或即将退出）
+                is_last_epoch = (
+                    epoch == self.config.num_train_epochs - 1
+                    or self.interrupted
+                    or (self.config.max_steps > 0 and self.global_step >= self.config.max_steps)
+                )
+                # 仅在最后一个 epoch 打印到控制台
+                if is_last_epoch:
+                    self.perf_monitor.print_summary()
 
                 if self.interrupted or self.config.max_steps > 0 and self.global_step >= self.config.max_steps:
                     break
 
         except Exception as e:
-            print(f"Training error: {e}")
+            self._print(f"Training error: {e}")
 
         finally:
-            print("\nSaving model...")
+            self._print("\nSaving model...")
             self._save_final_model()
             if self.interrupted:
-                print(f"Training stopped at step {self.global_step}")
+                self._print(f"Training stopped at step {self.global_step}")
             else:
-                print("Training completed successfully!")
+                self._print("Training completed successfully!")
 
         training_time = time.time() - start_time
         return {
@@ -509,6 +684,7 @@ class Trainer:
             "best_eval_loss": best_eval_loss,
             "global_step": self.global_step,
             "training_time": training_time,
+            "early_stopped": early_stopped,
         }
 
     @torch.no_grad()
@@ -537,13 +713,16 @@ class Trainer:
         perplexity = math.exp(avg_loss) if avg_loss < 10 else float("inf")
 
         results = {"loss": avg_loss, "perplexity": perplexity}
-        print(f"Evaluation results: loss={avg_loss:.4f}, perplexity={perplexity:.2f}")
+        self._print(f"Evaluation results: loss={avg_loss:.4f}, perplexity={perplexity:.2f}")
 
         if self.config.compute_metrics:
             additional_metrics = self.config.compute_metrics(results)
             results.update(additional_metrics)
 
-        self._log(results)
+        if self._logger:
+            self._logger.log_metrics(results, self.global_step, prefix="eval")
+        else:
+            self._log(results)
         self.model.train()
         return results
 
@@ -559,7 +738,7 @@ class Trainer:
             metrics=metrics,
             is_best=is_best,
         )
-        print(f"Checkpoint saved at step {step}")
+        self._print(f"Checkpoint saved at step {step}")
 
         # 清理GPU缓存
         if self.is_gpu:
@@ -569,7 +748,7 @@ class Trainer:
         """保存最终模型"""
         save_path = os.path.join(self.config.output_dir, "final_model")
         save_model(self.model, save_path)
-        print(f"Final model saved to {save_path}")
+        self._print(f"Final model saved to {save_path}")
 
 
 class TrainerState:

@@ -8,8 +8,8 @@
 .pytest_cache
 
 # Virtual environments
-venv/
-.venv/
+new_venv/
+.new_venv/
 env/
 .env/
 

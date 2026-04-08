@@ -406,6 +406,137 @@ class MemoryMappedDataset(Dataset):
             self._file.close()
 
 
+class ShardedFinetuneDataset(Dataset):
+    """
+    基于 mmap 的 JSONL 微调数据集（内存友好）
+    使用 mmap 建立行偏移索引，按需读取和 tokenize，避免全量加载
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer,
+        max_seq_length: int = 512,
+        instruction_column: str = "instruction",
+        input_column: str = "input",
+        output_column: str = "output",
+        template: str = "alpaca",
+    ):
+        self.data_path = data_path
+        self.tokenizer = tokenizer
+        self.max_seq_length = max_seq_length
+        self.instruction_column = instruction_column
+        self.input_column = input_column
+        self.output_column = output_column
+        self.template = template
+
+        if not data_path.endswith(".jsonl"):
+            raise ValueError(f"ShardedFinetuneDataset requires .jsonl format, got: {data_path}")
+
+        # 使用 mmap 建立行偏移索引
+        self._file = open(data_path, "r", encoding="utf-8")
+        self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+
+        # 构建行起始偏移列表
+        self._line_offsets = [0]
+        file_size = len(self._mmap)
+        pos = 0
+        while pos < file_size:
+            pos = self._mmap.find(b'\n', pos)
+            if pos == -1:
+                break
+            # 如果找到的换行符在文件末尾，不添加下一行的起始位置
+            if pos + 1 < file_size:
+                self._line_offsets.append(pos + 1)
+            pos += 1
+
+        self._num_lines = len(self._line_offsets)
+        print(f"  ShardedFinetuneDataset: {self._num_lines} examples (mmap lazy loading)")
+
+    def _format_prompt(self, item: Dict) -> Tuple[str, str]:
+        """格式化prompt（复用 FinetuneDataset 的模板逻辑）"""
+        instruction = item.get(self.instruction_column, "")
+        input_text = item.get(self.input_column, "")
+        output = item.get(self.output_column, "")
+
+        if self.template == "alpaca":
+            if input_text:
+                prompt = f"### Instruction:\n{instruction}\n\n### Input:\n{input_text}\n\n### Response:\n"
+            else:
+                prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
+            full_text = prompt + output
+        elif self.template == "chat":
+            messages = []
+            if input_text:
+                messages.append({"role": "user", "content": f"{instruction}\n{input_text}"})
+            else:
+                messages.append({"role": "user", "content": instruction})
+            messages.append({"role": "assistant", "content": output})
+            full_text = self._format_chat(messages)
+            prompt = full_text[:full_text.index(output)]
+        else:
+            prompt = f"Instruction: {instruction}\n"
+            if input_text:
+                prompt += f"Input: {input_text}\n"
+            prompt += "Output: "
+            full_text = prompt + output
+
+        return prompt, full_text
+
+    def _format_chat(self, messages: List[Dict]) -> str:
+        """格式化对话格式"""
+        formatted = ""
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            if role == "user":
+                formatted += f"⋳\n{content}\n"
+            elif role == "assistant":
+                formatted += f"<|assistant|)\n{content}\n"
+        return formatted
+
+    def __len__(self) -> int:
+        return self._num_lines
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # 从 mmap 读取一行 JSON
+        start = self._line_offsets[idx]
+        if idx + 1 < len(self._line_offsets):
+            end = self._line_offsets[idx + 1]
+        else:
+            end = len(self._mmap)
+        line = self._mmap[start:end].decode("utf-8").strip()
+
+        item = json.loads(line)
+        prompt, full_text = self._format_prompt(item)
+
+        # 编码
+        full_tokens = self.tokenizer.encode(full_text, add_special_tokens=True)
+        prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+
+        # 截断
+        if len(full_tokens) > self.max_seq_length:
+            full_tokens = full_tokens[:self.max_seq_length]
+
+        # 创建 labels: prompt 部分用 -100 屏蔽
+        labels = full_tokens.copy()
+        prompt_len = min(len(prompt_tokens), len(full_tokens))
+        for i in range(prompt_len):
+            labels[i] = -100
+
+        return {
+            "input_ids": torch.tensor(full_tokens, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "attention_mask": torch.tensor([1] * len(full_tokens), dtype=torch.long),
+        }
+
+    def __del__(self):
+        if hasattr(self, '_mmap'):
+            self._mmap.close()
+        if hasattr(self, '_file'):
+            self._file.close()
+
+
 def create_dataset(
     data_path: str,
     tokenizer,

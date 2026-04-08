@@ -5,9 +5,7 @@
 """
 import os
 import re
-import sys
 import zipfile
-import argparse
 import threading
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -484,12 +482,224 @@ class JSONExtractor:
         return '\n'.join(text_parts)
 
 
+class ParquetExtractor:
+    """
+    Parquet文本提取器
+    将Parquet每行转换为"列名: 值"格式，支持按大小分片
+    """
+
+    # 默认分片大小: 100MB
+    DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024
+
+    def __init__(self, parquet_path: str):
+        self.parquet_path = parquet_path
+
+    @staticmethod
+    def _format_row(row: dict, single_col: bool) -> str:
+        """将一行数据格式化为文本。单列时直接输出值，多列时用 '列名: 值' 格式。"""
+        fields = []
+        for col_name, value in row.items():
+            if value is None:
+                continue
+            str_val = str(value).strip()
+            if str_val:
+                fields.append(f"{col_name}: {str_val}" if not single_col else str_val)
+        return '\n'.join(fields)
+
+    def extract(self) -> Tuple[str, dict]:
+        """
+        提取Parquet内容
+
+        Returns:
+            (文本内容, 元数据字典)
+        """
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(self.parquet_path)
+        metadata = {
+            'columns': pf.schema_arrow.names,
+            'num_rows': pf.metadata.num_rows,
+            'record_count': pf.metadata.num_rows,
+        }
+
+        records = []
+        col_names = pf.schema_arrow.names
+        single_col = len(col_names) == 1
+        for batch in pf.iter_batches(batch_size=10000):
+            for row in batch.to_pylist():
+                line = self._format_row(row, single_col)
+                if line:
+                    records.append(line)
+
+        return '\n'.join(records), metadata
+
+    def extract_chunks(self, max_file_size: int = None) -> List[Tuple[str, dict]]:
+        """
+        流式读取Parquet并按大小分片
+
+        Args:
+            max_file_size: 每个分片的最大字节数（默认100MB）
+
+        Returns:
+            [(文本内容, 元数据), ...] 分片列表
+        """
+        import pyarrow.parquet as pq
+
+        if max_file_size is None:
+            max_file_size = self.DEFAULT_MAX_FILE_SIZE
+
+        pf = pq.ParquetFile(self.parquet_path)
+        total_rows = pf.metadata.num_rows
+
+        if total_rows == 0:
+            print(f"  警告: Parquet文件无数据行: {self.parquet_path}")
+            return []
+
+        chunks = []
+        current_lines = []
+        current_size = 0
+        chunk_idx = 0
+        rows_in_chunk = 0
+        single_col = len(pf.schema_arrow.names) == 1
+
+        for batch in pf.iter_batches(batch_size=10000):
+            for row in batch.to_pylist():
+                line = self._format_row(row, single_col)
+                if not line:
+                    continue
+
+                line_bytes = len(line.encode('utf-8'))
+
+                # 单行超过 max_file_size 时独占一个分片
+                if line_bytes > max_file_size:
+                    # 先保存当前累积的内容
+                    if current_lines:
+                        text = '\n'.join(current_lines)
+                        meta = {
+                            'chunk_index': chunk_idx,
+                            'record_count': rows_in_chunk,
+                            'columns': pf.schema_arrow.names,
+                        }
+                        chunks.append((text, meta))
+                        chunk_idx += 1
+                        current_lines = []
+                        current_size = 0
+                        rows_in_chunk = 0
+
+                    # 大行独占一个分片
+                    meta = {
+                        'chunk_index': chunk_idx,
+                        'record_count': 1,
+                        'columns': pf.schema_arrow.names,
+                    }
+                    chunks.append((line, meta))
+                    chunk_idx += 1
+                    continue
+
+                # 检查加入该行是否会超出大小限制
+                if current_lines:
+                    # 已有内容，新增需要加 \n 分隔符（1字节）
+                    new_size = current_size + 1 + line_bytes
+                else:
+                    new_size = line_bytes
+
+                if new_size > max_file_size and current_lines:
+                    # 保存当前分片
+                    text = '\n'.join(current_lines)
+                    meta = {
+                        'chunk_index': chunk_idx,
+                        'record_count': rows_in_chunk,
+                        'columns': pf.schema_arrow.names,
+                    }
+                    chunks.append((text, meta))
+                    chunk_idx += 1
+                    current_lines = [line]
+                    current_size = line_bytes
+                    rows_in_chunk = 1
+                else:
+                    current_lines.append(line)
+                    current_size = new_size
+                    rows_in_chunk += 1
+
+        # 处理剩余内容
+        if current_lines:
+            text = '\n'.join(current_lines)
+            meta = {
+                'chunk_index': chunk_idx,
+                'record_count': rows_in_chunk,
+                'columns': pf.schema_arrow.names,
+            }
+            chunks.append((text, meta))
+
+        return chunks
+
+
+def convert_parquet_to_txt(
+    input_path: str,
+    output_path: str = None,
+    max_file_size: int = None,
+) -> List[str]:
+    """
+    将Parquet文件转换为TXT（支持按大小分片）
+
+    Args:
+        input_path: 输入parquet文件路径
+        output_path: 输出TXT文件路径（可选，仅单分片时生效）
+        max_file_size: 每个分片的最大字节数（默认100MB）
+
+    Returns:
+        所有输出文件路径列表
+    """
+    input_path = os.path.abspath(input_path)
+
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"文件不存在: {input_path}")
+
+    extractor = ParquetExtractor(input_path)
+    chunks = extractor.extract_chunks(max_file_size)
+
+    if not chunks:
+        print(f"  警告: Parquet文件无有效数据: {input_path}")
+        return []
+
+    # 确定输出基础路径
+    if output_path is None:
+        base_name = os.path.splitext(input_path)[0]
+    else:
+        base_name = os.path.splitext(output_path)[0]
+
+    output_files = []
+
+    if len(chunks) == 1:
+        # 单分片 → base_name.txt
+        out_path = f"{base_name}.txt"
+        text, meta = chunks[0]
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        output_files.append(out_path)
+        print(f"  输出: {out_path} ({len(text):,} 字符)")
+    else:
+        # 多分片 → base_name_0001.txt, base_name_0002.txt, ...
+        for idx, (text, meta) in enumerate(chunks):
+            out_path = f"{base_name}_{idx + 1:04d}.txt"
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            output_files.append(out_path)
+            print(f"  分片 {idx + 1}/{len(chunks)}: {out_path} ({len(text):,} 字符)")
+
+    total_records = sum(m['record_count'] for _, m in chunks)
+    print(f"  总记录数: {total_records:,}, 输出文件: {len(output_files)} 个")
+
+    return output_files
+
+
 # 文件扩展名到提取器的映射
 EXTRACTORS = {
     '.pdf': PDFExtractor,
     '.csv': CSVExtractor,
     '.json': JSONExtractor,
     '.epub': EPUBExtractor,
+    '.parquet': ParquetExtractor,
 }
 
 
@@ -515,6 +725,11 @@ def convert_to_txt(input_path: str, output_path: str = None) -> str:
     if ext not in EXTRACTORS:
         supported = ', '.join(EXTRACTORS.keys())
         raise ValueError(f"不支持的格式: {ext}，支持的格式: {supported}")
+
+    # Parquet 文件走分片逻辑
+    if ext == '.parquet':
+        output_files = convert_parquet_to_txt(input_path, output_path)
+        return output_files[0] if output_files else None
 
     # 确定输出路径
     if output_path is None:
@@ -611,8 +826,17 @@ def _convert_single_file(
         with print_lock:
             print(f"[{file_idx}/{total_files}] 正在处理: {os.path.basename(input_path)}")
 
-        # 使用对应的提取器
+        # Parquet 文件走分片逻辑
         ext = os.path.splitext(input_path)[1].lower()
+        if ext == '.parquet':
+            output_files = convert_parquet_to_txt(input_path, output_path)
+            if not output_files:
+                raise ValueError("Parquet文件无有效数据")
+            with print_lock:
+                print(f"[{file_idx}/{total_files}] 完成: {base_name} -> {len(output_files)} 个文件")
+            return (input_path, True, output_files)
+
+        # 使用对应的提取器
         extractor = EXTRACTORS[ext](input_path)
         text, metadata = extractor.extract()
 
@@ -705,7 +929,11 @@ def batch_convert(
         for future in as_completed(futures):
             input_path, success, result = future.result()
             if success:
-                success_files.append(result)
+                # parquet 返回 List[str]，其他返回 str
+                if isinstance(result, list):
+                    success_files.extend(result)
+                else:
+                    success_files.append(result)
             else:
                 failed_files[input_path] = result
 
@@ -746,62 +974,3 @@ def merge_txt_files(txt_files: List[str], output_path: str, separator: str = "\n
 
     total_chars = sum(os.path.getsize(f) for f in txt_files if os.path.exists(f))
     print(f"合并完成，总大小: {total_chars:,} 字节")
-
-
-def main():
-    """主函数"""
-    supported_formats = ', '.join(EXTRACTORS.keys())
-    parser = argparse.ArgumentParser(
-        description=f"文本转换工具 - 支持 {supported_formats} 格式转换为TXT",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例用法:
-  # 转换单个文件 (支持 PDF, CSV, JSON, EPUB)
-  python document_converter.py book.epub
-  python document_converter.py document.pdf
-  python document_converter.py data.csv
-  python document_converter.py data.json
-
-  # 指定输出路径
-  python document_converter.py book.epub -o output.txt
-
-  # 批量转换目录（默认使用CPU核数并发）
-  python document_converter.py -d /path/to/documents -o /path/to/output
-
-  # 指定并发线程数
-  python document_converter.py -d /path/to/documents -w 4
-
-  # 串行模式（单线程）
-  python document_converter.py -d /path/to/documents -w 1
-
-  # 批量转换并合并为一个文件
-  python document_converter.py -d /path/to/documents --merge merged.txt
-        """
-    )
-
-    parser.add_argument("input", nargs="?", help=f"输入文件路径 ({supported_formats})")
-    parser.add_argument("-o", "--output", help="输出TXT文件或目录路径")
-    parser.add_argument("-d", "--dir", help="批量转换的输入目录")
-    parser.add_argument("-w", "--workers", type=int, default=None,
-                        help="并发线程数 (默认: CPU核数)")
-    parser.add_argument("--merge", metavar="OUTPUT_FILE", help="合并所有转换结果为一个文件")
-
-    args = parser.parse_args()
-
-    if args.dir:
-        # 批量转换模式
-        txt_files = batch_convert(args.dir, args.output, args.workers)
-
-        if args.merge and txt_files:
-            merge_txt_files(txt_files, args.merge)
-
-    elif args.input:
-        # 单文件转换模式
-        convert_to_txt(args.input, args.output)
-
-    else:
-        parser.print_help()
-
-
-if __name__ == "__main__":
-    main()

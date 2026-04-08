@@ -69,7 +69,6 @@ transformer/
 │   │   └── cleaning_db.py      # 清洗数据数据库存储
 │   │
 │   ├── crawler/                 # 爬虫层 - 异步爬取、浏览器自动化、反爬
-│   │   ├── cli.py              # 命令行接口
 │   │   ├── engine.py           # 爬虫引擎（httpx + BeautifulSoup）
 │   │   ├── config.py           # CrawlerConfig — 爬虫配置
 │   │   ├── browser/            # Playwright 浏览器自动化
@@ -86,7 +85,10 @@ transformer/
 │       └── repository.py        # CrawlerPageRepository / CleanedDocumentRepository
 │
 ├── scripts/                      # 训练脚本入口
+│   ├── crawl.py                 # 网络爬虫批量爬取
+│   ├── clean_data.py            # 数据清洗（PII/去重/质量过滤）
 │   ├── preprocess_data.py       # 数据预处理（tokenize + 分片）
+│   ├── preprocess_sft_data.py   # SFT 数据预处理（tokenize + 分片）
 │   ├── pretrain.py              # 预训练（CPU/GPU 自动检测）
 │   ├── finetune.py              # 指令微调 (SFT)
 │   └── generate.py              # 文本生成
@@ -108,7 +110,7 @@ transformer/
 | **data** | Tokenizer、数据集、DataLoader | `tokenizer.py`, `dataset.py`, `collator.py` |
 | **training** | 统一训练器，优化器与调度器 | `trainer.py`, `optimizer.py`, `scheduler.py` |
 | **data_processing** | 文本清洗、文档转换、去重、脱敏 | `clean_text.py`, `pipeline.py`, `deduplicate.py` |
-| **crawler** | 异步爬虫、浏览器自动化、反反爬虫 | `engine.py`, `cli.py` |
+| **crawler** | 异步爬虫、浏览器自动化、反反爬虫 | `engine.py` |
 | **utils** | 设备管理、日志、指标、数据库 | `device.py`, `logging.py`, `metrics.py` |
 
 ---
@@ -136,6 +138,11 @@ python scripts/preprocess_data.py \
     --max_seq_length 512 \
     --vocab_size 32000
 
+# 验证集支持三种传入方式（三选一）：
+# --validation_file val.txt              # 单个文件
+# --validation_files val1.txt val2.txt   # 多个文件
+# --validation_dir dataset/val/          # 自动扫描目录下 .txt 文件
+
 # 2. 预训练
 python scripts/pretrain.py \
     --preprocessed_data output/preprocessed \
@@ -143,8 +150,22 @@ python scripts/pretrain.py \
     --num_train_epochs 3
 
 # 3. 指令微调（可选）
+# 方式A：直接使用原始数据
 python scripts/finetune.py \
     --train_file data/instructions.json \
+    --model_path output/final_model \
+    --num_train_epochs 3
+
+# 方式B：先预处理 SFT 数据，再训练（推荐，加速数据加载）
+python scripts/preprocess_sft_data.py \
+    --train_file data/instructions.jsonl \
+    --validation_file data/val.jsonl \
+    --output_dir output/sft_preprocessed \
+    --template alpaca \
+    --tokenizer_path output/preprocessed/tokenizer
+
+python scripts/finetune.py \
+    --preprocessed_data output/sft_preprocessed \
     --model_path output/final_model \
     --num_train_epochs 3
 
@@ -160,12 +181,21 @@ python scripts/generate.py \
 
 ### 方式一：从文档转换
 
-```bash
-# PDF / EPUB / CSV / JSON → TXT（并发转换）
-python -m src.data_processing.document_converter -d ./documents --merge raw_data.txt
+```python
+from src.data_processing import batch_convert, merge_txt_files
 
+# PDF / EPUB / CSV / JSON → TXT（并发转换）
+txt_files = batch_convert("./documents", "./txt_output")
+merge_txt_files(txt_files, "raw_data.txt")
+```
+
+```bash
 # 清洗文本
-python -m src.data_processing.clean_text clean raw_data.txt -o cleaned.txt
+python scripts/clean_data.py -i raw_data.txt -o cleaned.txt
+
+# 目录批量清洗（并发模式，利用多核 CPU 加速）
+python scripts/clean_data.py -I data/raw -O data/clean --no-doc-dedup --workers 4
+# --workers N  并发进程数（默认 1=串行，0=自动=CPU 核数，仅 --no-doc-dedup 模式有效）
 
 # 预处理
 python scripts/preprocess_data.py --train_file cleaned.txt --output_dir output/preprocessed
@@ -174,7 +204,23 @@ python scripts/preprocess_data.py --train_file cleaned.txt --output_dir output/p
 ### 方式二：从网络爬取
 
 ```bash
-python -m src.crawler.cli run --config configs/crawler/crawler_config.yaml --parallel 2
+# 从配置文件批量爬取
+python scripts/crawl.py run --config configs/crawler/crawler_config.yaml --parallel 2
+
+# 查看爬虫状态
+python scripts/crawl.py status
+```
+
+或使用 Python API：
+
+```python
+from src.crawler.engine import crawl_sites
+
+total_pages = await crawl_sites(
+    config_path="configs/crawler/crawler_config.yaml",
+    output_dir="./output/crawled",
+    max_concurrent=2,
+)
 ```
 
 ---
@@ -201,6 +247,7 @@ python -m src.crawler.cli run --config configs/crawler/crawler_config.yaml --par
 - **MoE 混合专家** — DeepSeek-V3 风格，共享专家 + Top-K 路由
 - **MLA 多头潜在注意力** — DeepSeek-V2 风格，KV 压缩
 - **梯度检查点** — 显存节省（可选）
+- **Early Stopping** — 验证集 loss 连续未改善时自动终止训练
 - **手动终止保存** — Ctrl+C 自动保存检查点
 
 ---
@@ -232,13 +279,15 @@ pytest tests/test_crawler.py -v
 
 - ✅ 统一训练器（CPU/GPU 自动检测）
 - ✅ 数据预处理 + 分片加载
+- ✅ SFT 数据预处理 + 预处理数据微调
 - ✅ HuggingFace tokenizers 集成（21x 加速）
 - ✅ Flash Attention / GQA / YaRN / StreamingLLM
 - ✅ MoE (DeepSeek-V3 风格) / MLA (DeepSeek-V2 风格)
 - ✅ 增量预处理
 - ✅ 性能监控（Data Loading / Forward / Backward / Optimizer Step）
 - ✅ 支持手动终止训练（Ctrl+C）自动保存
+- ✅ Early Stopping（验证集 loss 连续未改善自动终止）
 - ✅ 网络爬虫系统
 - ✅ 文档格式转换（PDF / EPUB / CSV / JSON）
-- ✅ 文本清洗流水线（PII 脱敏 / 去重 / 质量过滤）
+- ✅ 文本清洗流水线（PII 脱敏 / 去重 / 质量过滤 / 并发清洗）
 - ✅ 清洗数据数据库存储

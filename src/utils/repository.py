@@ -527,6 +527,16 @@ class CleanedDocumentRepository(BaseRepository):
         rows = DatabaseManager.execute_query(query, (f"%{keyword}%", limit), self.db_path)
         return DatabaseManager.rows_to_list(rows)
 
+    def get_all_processed_md5s(self) -> set:
+        """获取所有非空 original_md5 的集合
+
+        Returns:
+            所有已处理文档的 original_md5 集合
+        """
+        query = "SELECT original_md5 FROM cleaned_documents WHERE original_md5 IS NOT NULL AND original_md5 != ''"
+        rows = DatabaseManager.execute_query(query, (), self.db_path)
+        return {row["original_md5"] for row in rows}
+
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息
 
